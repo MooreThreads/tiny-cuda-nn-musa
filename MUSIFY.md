@@ -13,11 +13,11 @@
 | Docker image | 4.3.5_kuae2.1_20260119_torch2.7.1_ubuntu |
 | MT GPU type | S5000 |
 | Pipeline start | 2026-03-14 15:03:20 UTC |
-| Pipeline end | |
-| Elapsed | |
-| Last updated | 2026-03-14 15:18 |
+| Pipeline end | 2026-03-14 15:41:04 UTC |
+| Elapsed | 0h 37m 44s |
+| Last updated | 2026-03-14 15:41 |
 | Director | xiaofeng |
-| Status | in-progress |
+| Status | blocked |
 
 ## Migration Plan
 
@@ -60,7 +60,7 @@ None — all dependencies are either CUDA ecosystem (handled by API mapping) or 
 | 1b. lookuper (document-site) | done | 2026-03-14 15:05 | 2026-03-14 15:12 | Pre-existing, extended versions resolved |
 | 1c. lookuper (docker setup) | done | 2026-03-14 15:05 | 2026-03-14 15:12 | Container running, GPU verified |
 | 2. api-mapping | done | 2026-03-14 15:12 | 2026-03-14 15:18 | Full mapping complete, nvrtc NOT AVAILABLE |
-| 3. musa-adapt | in-progress | 2026-03-14 15:18 | | |
+| 3. musa-adapt | blocked | 2026-03-14 15:18 | 2026-03-14 15:41 | Build OK (mcc), runtime blocked by PrivateUse1 device |
 
 #### Stage Details
 
@@ -119,10 +119,45 @@ None — all dependencies are either CUDA ecosystem (handled by API mapping) or 
 | 2 | Main | 2. api-mapping | degraded | PTX mma.sync/wmma instructions not available in MUSA | open | Guard with __MUSA_ARCH__ or disable fully_fused_mlp |
 | 3 | Main | 2. api-mapping | blocking | WARP_SIZE=32 hardcoded, S5000 needs 128 | open | Change constant and verify all warp-level operations |
 
+**Stage 3 — Adaptation:**
+- adapt-code: done -- SimplePorting converted 11 .mu source + 59 .h headers + 4 .mu tests
+- adapt-build: partial -- setup.py modified for MUSAExtension, builds with mcc
+- adapt-verify: blocked -- C++ API allocates tensors on CUDA backend, needs PrivateUse1 fix
+- adapt-fix iterations: 5 (incremental fixing of mapping gaps, PTX assembly, compiler macros)
+
 ## Knowledge Base
 
-(No entries yet.)
+### [Round 1] adapt-code + adapt-build -- 2026-03-14
+- **Status**: partial
+- **What**: Full pipeline from clone through code analysis, API mapping, SimplePorting, build system modification, and compilation
+- **Result**: Compilation succeeds with mcc. Runtime fails due to C++ API using CUDA device backend internally.
+- **Root cause**: tiny-cuda-nn's C++ core (`cpp_api.cu`, `gpu_memory.h`) calls `torch::empty` with `at::kCUDA` device type. In torch_musa, the device is `PrivateUse1`, not `CUDA`. The compiled `.so` links correctly but PyTorch dispatch fails at runtime.
+- **Fix applied**: SimplePorting + manual fixes for PTX asm, CUDA Driver API, compiler macros. Build succeeds (encodings-only, networks disabled).
+- **Files changed**: setup.py, bindings.cpp, modules.py, simple_porting_tcnn.py + all _musa/ directories
+- **Key insight**: tiny-cuda-nn's C++ API has deep coupling with CUDA backend device type. The `initial_params()` method internally creates tensors on `kCUDA`, which is not registered in torch_musa. Fixing this requires modifying `cpp_api.cu` to use `PrivateUse1` device when compiled for MUSA. Additionally, the project's core differentiators (fully fused MLPs via PTX mma.sync, JIT compilation via nvrtc) have NO MUSA equivalents, making a full-featured migration impossible with current MUSA SDK.
+- **Avoid**: Do not attempt to port the PTX inline assembly (mma.sync, wmma) -- these are NVIDIA-specific. Do not expect nvrtc/RTC to work on MUSA.
 
 ## Final Report
 
-(Pending pipeline completion.)
+### Summary
+- Total elapsed time: 0h 37m 44s
+- Total files ported: 11 .mu source + 59 .h headers + 4 .mu tests (via SimplePorting), 3 Python files manually converted, 1 .cpp modified
+- Build: **PASS** (compilation with mcc succeeds, encodings-only mode)
+- Tests: **NOT RUN** (blocked by runtime device allocation issue)
+- Numerical verification: **NOT RUN**
+- Issues encountered: 4 blocking, 0 resolved, 4 unresolved
+- Total adapt-fix iterations: 5
+
+### Changes Made
+1. **SimplePorting script** (`simple_porting_tcnn.py`): Converts src/, include/, tests/, samples/, benchmarks/ from CUDA to MUSA with 80+ custom mapping rules
+2. **setup.py**: Added `FORCE_MUSA=1` build path using `MUSAExtension`, disabled RTC and networks
+3. **bindings.cpp**: Added `#ifdef FORCE_MUSA` guards for MUSAGuard, MUSAStream, device type checks
+4. **modules.py**: Converted all `torch.cuda.*` calls to `torch.musa.*` equivalents
+5. **Post-porting fixes**: lane_id PTX replaced with `threadIdx.x % warpSize`, CUDA Driver API mappings added, compiler version macros corrected, CUDA version assertion disabled
+
+### Known Limitations
+1. **nvrtc/RTC not available**: MUSA SDK has no runtime compilation equivalent. JIT-fused kernels (the project's primary performance feature) cannot work on MUSA. Build with `TCNN_BUILD_WITH_RTC=OFF`.
+2. **fully_fused_mlp disabled**: Requires PTX `mma.sync` and `wmma` tensor core instructions which are NVIDIA-specific. MUSA has `sqmma` (SQMMA) which uses a completely different API. Porting would require a ground-up rewrite of the fused MLP kernel.
+3. **cutlass_mlp disabled**: NVIDIA CUTLASS headers include `cuda_fp16.h` which doesn't exist in MUSA. MooreThreads has `mutlass` but integration would require replacing all cutlass include paths and verifying API compatibility.
+4. **C++ API device allocation**: The core C++ library creates PyTorch tensors with `at::kCUDA` device type. In torch_musa, the correct device is `PrivateUse1`. This requires modifying `cpp_api.cu` and `gpu_memory.h` to detect the backend at runtime.
+5. **WARP_SIZE = 32**: Hardcoded throughout the codebase. MUSA S5000 reports `warpSize = 32` via compatibility layer, but the actual hardware warp size is 128. This may cause correctness issues with warp-level operations (shuffles, votes, reductions).
