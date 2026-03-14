@@ -34,8 +34,14 @@
 #include <torch/extension.h>
 #endif
 
+#ifdef FORCE_MUSA
+#include "torch_musa/csrc/core/MUSAGuard.h"
+#include "torch_musa/csrc/core/MUSAStream.h"
+#include <musa_runtime.h>
+#else
 #include <ATen/cuda/CUDAUtils.h>
 #include <c10/cuda/CUDAGuard.h>
+#endif
 
 #ifdef snprintf
 #undef snprintf
@@ -54,6 +60,12 @@
 #define CHECK_THROW(x) \
 	do { if (!(x)) throw std::runtime_error(std::string(FILE_LINE " check failed " #x)); } while(0)
 
+#ifdef FORCE_MUSA
+#define CHECK_INPUT(x) CHECK_THROW(x.device().is_privateuseone()); CHECK_THROW(x.is_contiguous())
+#else
+#define CHECK_INPUT(x) CHECK_THROW(x.device().is_cuda()); CHECK_THROW(x.is_contiguous())
+#endif
+
 c10::ScalarType torch_type(tcnn::cpp::Precision precision) {
 	switch (precision) {
 		case tcnn::cpp::Precision::Fp32: return torch::kFloat32;
@@ -69,8 +81,6 @@ void* void_data_ptr(torch::Tensor& tensor) {
 		default: throw std::runtime_error{"Unknown precision torch->void"};
 	}
 }
-
-#define CHECK_INPUT(x) CHECK_THROW(x.device().is_cuda()); CHECK_THROW(x.is_contiguous())
 
 class Module {
 public:
@@ -92,8 +102,13 @@ public:
 		at::Device device = input.device();
 		CHECK_THROW(device == params.device());
 
+		#ifdef FORCE_MUSA
+		const at::musa::MUSAGuard device_guard{device};
+		musaStream_t stream = at::musa::getCurrentMUSAStream();
+#else
 		const at::cuda::CUDAGuard device_guard{device};
 		cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#endif
 
 		uint32_t batch_size = input.size(0);
 
@@ -138,8 +153,13 @@ public:
 		CHECK_THROW(device == output.device());
 		CHECK_THROW(device == dL_doutput.device());
 
+		#ifdef FORCE_MUSA
+		const at::musa::MUSAGuard device_guard{device};
+		musaStream_t stream = at::musa::getCurrentMUSAStream();
+#else
 		const at::cuda::CUDAGuard device_guard{device};
 		cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#endif
 
 		uint32_t batch_size = input.size(0);
 
@@ -203,8 +223,13 @@ public:
 		CHECK_THROW(device == dL_ddLdinput.device());
 		CHECK_THROW(device == dL_doutput.device());
 
+		#ifdef FORCE_MUSA
+		const at::musa::MUSAGuard device_guard{device};
+		musaStream_t stream = at::musa::getCurrentMUSAStream();
+#else
 		const at::cuda::CUDAGuard device_guard{device};
 		cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#endif
 
 		uint32_t batch_size = input.size(0);
 

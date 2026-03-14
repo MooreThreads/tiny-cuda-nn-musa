@@ -1,0 +1,38 @@
+digraph CUDA_DEPENDENCIES {
+    rankdir=TB;
+    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10];
+
+    tcnn [label="tiny-cuda-nn [CU]\n11 .cu source, 90+ .h headers\nCMake + setup.py (Hybrid)", fillcolor="#ff6b6b", fontcolor="white"];
+    pytorch [label="PyTorch [PT]\ntorch.utils.cpp_extension\nCUDAExtension", fillcolor="#6c9bd9", fontcolor="white"];
+    cutlass [label="CUTLASS [CE]\nvendored submodule\n~450 .cu/.cuh files", fillcolor="#ffcc5c"];
+
+    subgraph cluster_ecosystem {
+        label="CUDA Ecosystem (Out-of-Scope)";
+        style=dashed;
+        cublas [label="cuBLAS [CE]\noptional (Shampoo only)", fillcolor="#ffcc5c"];
+        nvrtc [label="nvrtc [CE]\nruntime compilation", fillcolor="#ffcc5c"];
+        cuda_driver [label="CUDA Driver API [CE]\ncuModuleLoadData\ncuLaunchKernel", fillcolor="#ffcc5c"];
+        cuda_graph [label="CUDA Graphs [CE]\ncudaStreamBeginCapture\ncudaGraphLaunch", fillcolor="#ffcc5c"];
+    }
+
+    subgraph cluster_vendored {
+        label="Vendored Dependencies (CUDA-free)";
+        style=dashed;
+        color=gray;
+        fmt [label="fmt [CUDA-free]\nC++ formatting", fillcolor="#88d8b0"];
+        cmrc [label="cmrc [CUDA-free]\nresource compiler", fillcolor="#88d8b0"];
+        pcg32 [label="pcg32 [CUDA-aware]\nRNG (device code)", fillcolor="#88d8b0"];
+        json [label="nlohmann/json [CUDA-free]", fillcolor="#88d8b0"];
+    }
+
+    tcnn -> pytorch [label="CUDAExtension\nbindings/torch/"];
+    tcnn -> cutlass [label="#include <cutlass/...>\ncutlass_mlp.cu, cutlass_matmul.h"];
+    tcnn -> cublas [label="#include <cublas_v2.h>\noptional, shampoo.h only"];
+    tcnn -> nvrtc [label="#include <nvrtc.h>\nrtc_kernel.cu (JIT)"];
+    tcnn -> cuda_driver [label="#include <cuda.h>\ncuda_graph.h, rtc_kernel.cu"];
+    tcnn -> cuda_graph [label="cudaStreamBeginCapture\ncuda_graph.h"];
+    tcnn -> fmt [label="fmt::format\nthroughout"];
+    tcnn -> cmrc [label="CMRC_DECLARE\nembedded resources for RTC"];
+    tcnn -> pcg32 [label="#include <pcg32/pcg32.h>\ncommon_device.h"];
+    tcnn -> json [label="nlohmann::json\nconfig.h"];
+}

@@ -13,18 +13,19 @@ import tempfile
 import warnings
 
 import torch
+import torch_musa
 
 ALL_COMPUTE_CAPABILITIES = [20, 21, 30, 35, 37, 50, 52, 53, 60, 61, 62, 70, 72, 75, 80, 86, 87, 89, 90, 100, 101, 120]
 
-if not torch.cuda.is_available():
-	raise EnvironmentError("Unknown compute capability. Ensure PyTorch with CUDA support is installed.")
+if not torch.musa.is_available():
+	raise EnvironmentError("Unknown compute capability. Ensure PyTorch with MUSA support is installed.")
 
 def _get_device_compute_capability(idx):
-	major, minor = torch.cuda.get_device_capability(idx)
+	major, minor = torch.musa.get_device_capability(idx)
 	return major * 10 + minor
 
 def _get_system_compute_capability():
-	num_devices = torch.cuda.device_count()
+	num_devices = torch.musa.device_count()
 	device_capability = [_get_device_compute_capability(i) for i in range(num_devices)]
 	system_capability = min(device_capability)
 
@@ -149,9 +150,9 @@ class _module_function(torch.autograd.Function):
 		if doutput is None:
 			return None, None, None, None
 
-		if not doutput.is_cuda:
-			warnings.warn("doutput must be a CUDA tensor, but isn't. This indicates suboptimal performance.")
-			doutput = doutput.cuda()
+		if not doutput.is_musa:
+			warnings.warn("doutput must be a MUSA tensor, but isn't. This indicates suboptimal performance.")
+			doutput = doutput.musa()
 
 		input, params, output = ctx.saved_tensors
 		input_grad, params_grad = _module_function_backward.apply(ctx, doutput, input, params, output)
@@ -215,9 +216,9 @@ class Module(torch.nn.Module):
 		self.loss_scale = _C.default_loss_scale(self.native_tcnn_module.param_precision())
 
 	def forward(self, x):
-		if not x.is_cuda:
-			warnings.warn("input must be a CUDA tensor, but isn't. This indicates suboptimal performance.")
-			x = x.cuda()
+		if not x.is_musa:
+			warnings.warn("input must be a MUSA tensor, but isn't. This indicates suboptimal performance.")
+			x = x.musa()
 
 		batch_size = x.shape[0]
 		batch_size_granularity = int(_C.batch_size_granularity())
