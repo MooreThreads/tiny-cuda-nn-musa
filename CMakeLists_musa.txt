@@ -1,0 +1,98 @@
+cmake_minimum_required(VERSION 3.18)
+
+project(
+    tiny-cuda-nn
+    VERSION 2.0
+    DESCRIPTION "tiny-cuda-nn MUSA port (encodings-only)"
+    LANGUAGES CXX
+)
+
+# ── MUSA toolchain ─────────────────────────────────────────────────────────────
+list(APPEND CMAKE_MODULE_PATH /usr/local/musa/cmake)
+find_package(MUSA REQUIRED)
+
+set(MUSA_MCC_FLAGS
+    --offload-arch=mp_31       # S5000 (MT-3000 series, major=3 minor=1)
+    -Wno-unused-function
+    -Wno-unused-variable
+)
+
+# ── Options ────────────────────────────────────────────────────────────────────
+option(TCNN_BUILD_BENCHMARK "Build benchmarks?" OFF)
+option(TCNN_BUILD_EXAMPLES  "Build examples?"   OFF)
+option(TCNN_BUILD_TESTS     "Build tests?"      OFF)
+
+# ── C++ standard ──────────────────────────────────────────────────────────────
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# ── Sources (encodings-only: exclude wmma and nvrtc) ─────────────────────────
+# NOTE: cuda_rtc_kernel_stub.cpp is plain CXX -- handled separately below,
+#       NOT here (musa_add_library silently drops plain .cpp sources)
+set(TCNN_SOURCES
+    src_musa/common_host.mu
+    src_musa/cpp_api.mu
+    src_musa/encoding.mu
+    src_musa/loss.mu
+    src_musa/network.mu
+    src_musa/object.mu
+    src_musa/optimizer.mu
+    src_musa/reduce_sum.mu
+    # cutlass_mlp.mu excluded: depends on vendored CUTLASS (NVIDIA SM archs)
+    # fully_fused_mlp.mu excluded: depends on nvcuda::wmma PTX
+    # cuda_rtc_kernel_stub.cpp excluded from musa_add_library -- see tcnn-rtc-stub below
+    # rtc_kernel.mu excluded: see cuda_rtc_kernel_stub.cpp instead
+)
+
+# ── Definitions ───────────────────────────────────────────────────────────────
+set(TCNN_DEFINITIONS
+    -DTCNN_MIN_GPU_ARCH=21        # mp_21 = S5000
+    -DTCNN_HALF_PRECISION=1
+    -DTCNN_NO_FULLY_FUSED_MLP     # disable wmma code paths
+    # TCNN_RTC not defined         # disable NVRTC code paths
+    # TCNN_SHAMPOO not defined      # disable cuBLAS/cuSolver Shampoo optimizer
+)
+
+# ── Includes ──────────────────────────────────────────────────────────────────
+set(TCNN_INCLUDES
+    include_musa                  # ported headers
+    dependencies                  # fmt, json, pcg32, cmrc (CUDA-free)
+    # dependencies/cutlass/include NOT included (NVIDIA-specific)
+)
+
+# ── fmt dependency (CUDA-free) ────────────────────────────────────────────────
+set(BUILD_SHARED_LIBS OFF)
+set(FMT_UNICODE OFF CACHE BOOL "" FORCE)
+add_subdirectory("dependencies/fmt")
+
+# ── cmrc resource library ─────────────────────────────────────────────────────
+include("${CMAKE_CURRENT_SOURCE_DIR}/dependencies/cmrc/CMakeRC.cmake")
+cmrc_add_resource_library(tiny-cuda-nn-resources NAMESPACE tcnn)
+set(TCNN_DEFINITIONS ${TCNN_DEFINITIONS} -DTCNN_CMRC)
+
+# ── Build the library ──────────────────────────────────────────────────────────
+musa_add_library(tiny-cuda-nn STATIC ${TCNN_SOURCES})
+target_compile_definitions(tiny-cuda-nn PUBLIC ${TCNN_DEFINITIONS})
+target_include_directories(tiny-cuda-nn PUBLIC ${TCNN_INCLUDES})
+target_link_libraries(tiny-cuda-nn fmt tiny-cuda-nn-resources)
+
+# ── RTC stub (plain CXX -- bypass musa_add_library limitation) ─────────────────
+# musa_add_library silently drops plain .cpp sources; use a separate add_library.
+# Strip -D prefix from definitions (target_compile_definitions does not use -D).
+# Link fmt to get fmt/format.h include path.
+add_library(tcnn-rtc-stub STATIC src_musa/cuda_rtc_kernel_stub.cpp)
+target_include_directories(tcnn-rtc-stub PUBLIC ${TCNN_INCLUDES})
+target_compile_definitions(tcnn-rtc-stub PUBLIC
+    TCNN_MIN_GPU_ARCH=21
+    TCNN_HALF_PRECISION=1
+    TCNN_NO_FULLY_FUSED_MLP
+    TCNN_CMRC
+)
+target_link_libraries(tcnn-rtc-stub fmt)
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+if (TCNN_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests_musa)
+endif()
