@@ -362,3 +362,109 @@ Please feel free to make a pull request if your publication or software is not l
 ## Acknowledgments
 
 Special thanks go to the NRC authors for helpful discussions and to [Nikolaus Binder](https://research.nvidia.com/person/nikolaus-binder) for providing part of the infrastructure of this framework, as well as for help with utilizing TensorCores from within CUDA.
+
+## MUSA Migration
+
+This project has been ported to [MooreThreads](https://www.mthreads.com/) MUSA via the [auto-musify](https://sh-gitlab.mthreads.com/auto-musify) pipeline. The ported code lives in `src_musa/`, `include_musa/`, and `tests_musa/` parallel to the original CUDA sources (per the auto-musify parallel-folder porting rule — originals are never modified). The MUSA build path is activated via `-DUSE_MUSA=ON`; the CUDA build path compiles the originals unchanged.
+
+### Build + install
+
+Environment (pinned at `2026-04-21 04:10:07 UTC`):
+
+| Component | Version |
+|---|---|
+| MUSA SDK (`mcc` / `musa-runtime`) | `5.1.0` |
+| muDNN | `3.3.0.0` |
+| muBLAS | `1.12.0` |
+| MCCL | `2.28.9` |
+| Triton | `3.2.0` |
+| torch_musa | `2.9.0+74f5782` (not required by this library; listed for container reference) |
+| MT GPU | `MTT S5000` (`QY2` arch, `mp_31` compile target) |
+| Container image | `auto-musify-sdk:5.1.0-daily-20260416-S5000` |
+| Driver | `5.1.0-server` |
+
+Build (inside an auto-musify-provisioned container, with the worktree mounted at `/workspace/tiny-cuda-nn`):
+
+```bash
+cd /workspace/tiny-cuda-nn
+mkdir -p musa_build_root && cp CMakeLists_musa.txt musa_build_root/CMakeLists.txt
+ln -sfn ../src_musa     musa_build_root/src_musa
+ln -sfn ../include_musa musa_build_root/include_musa
+ln -sfn ../tests_musa   musa_build_root/tests_musa
+ln -sfn ../dependencies musa_build_root/dependencies
+rm -rf build_musa
+cmake -S musa_build_root -B build_musa \
+  -DUSE_MUSA=ON -DTCNN_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build_musa -j$(nproc)
+```
+
+Artifacts produced in `build_musa/`: `libtiny-cuda-nn.a` (~9.5 MB, MUSA static lib) and `libtcnn-rtc-stub.a` (~7 KB, host-only stubs for `RTCKernel`). Link `libtiny-cuda-nn.a` from your consumer project the same way as the CUDA build's `libtiny-cuda-nn.a`.
+
+Key CMake flags (wired by the port, no manual edit needed):
+
+- `USE_MUSA=ON` — selects MUSA build path.
+- `TCNN_BUILD_TESTS=ON` — enables `tests_musa/` subdirectory.
+- `-DFMT_USE_FLOAT128=0` in `TCNN_DEFINITIONS` — **required**: `mcc` at `mp_31` rejects `__float128` despite host clang-14 reporting `__SIZEOF_FLOAT128__`. Without this flag, `fmt/format.h:729` fails to compile.
+- `TCNN_SOURCES` intentionally omits `fully_fused_mlp.mu`, `cutlass_mlp.mu`, `rtc_kernel.mu` — see **Known limitations** below.
+
+### Verification
+
+- **Overall**: `PASS` — `47,186,029 / 47,186,029` assertions (100%) across 3 Catch2 test cases in 2 binaries.
+- **Tier**: `cosmetic` (portable-path Catch2 re-run).
+- **Tested on**: `MTT S5000` + MUSA SDK `5.1.0` + `torch_musa 2.9.0+74f5782`.
+
+| Category | Precision | Passed | Failed | Pass rate |
+|---|---|---|---|---|
+| Encodings invariance (`[encoding][jit]`) — `network_precision_t` (half) | half | 1 case | 0 | 100% |
+| Encodings invariance (`[encoding][jit]`) — `float` (fp32) | fp32 | 1 case | 0 | 100% |
+| Encodings aggregate (`test_encodings`) | mixed | 47,186,016 asserts | 0 | 100% |
+| Grid sanity (`test_grid`, `[encoding]`) | default | 13 asserts | 0 | 100% |
+| **Aggregate (all portable paths)** | mixed | **47,186,029 asserts** | 0 | **100%** |
+
+Run:
+
+```bash
+cd /workspace/tiny-cuda-nn/build_musa
+MUSA_VISIBLE_DEVICES=0 ./tests_musa/test_encodings --durations=yes
+MUSA_VISIBLE_DEVICES=0 ./tests_musa/test_grid --durations=yes
+```
+
+Known limitations (all **wontfix** on MUSA — fundamental hw/SDK gaps):
+
+- `FullyFusedMLP` — requires NVIDIA PTX `wmma` tensor-core inline asm; no MUSA equivalent intrinsic. Fall back to the non-fused `Network` path. See [MUSIFY.md → Known Limitations](MUSIFY.md#known-limitations).
+- `CutlassMLP` — depends on NVIDIA CUTLASS (SM-architecture-specific tile iterators; no MT header-library alternative). Use the non-CUTLASS `NetworkWithInputEncoding` path.
+- `RTCKernel` / `CudaRtcKernel` — no MUSA NVRTC equivalent → runtime JIT kernel compilation unavailable. `src_musa/cuda_rtc_kernel_stub.cpp` is linked as `libtcnn-rtc-stub.a` and throws at call time; use statically-compiled kernels only.
+- `FMT_USE_FLOAT128` must stay force-disabled — see CMake flags above.
+
+Sub-note — `fix-issues cluster-001` on `2026-04-21`: closes upstream gitlab [auto-musify/tiny-cuda-nn#1](https://sh-gitlab.mthreads.com/auto-musify/tiny-cuda-nn/-/issues/1); reconfirms the three wontfix subsystems + `FMT_USE_FLOAT128` workaround on SDK `5.1.0`; portable-path test suites re-run green (+13 asserts, +1 case vs. the prior SDK `4.3.6` baseline — `test_grid` got properly re-enabled during this run's SimplePorting regeneration).
+
+### Usage examples
+
+As a library consumer (C++), the MUSA build path is drop-in-compatible with the CUDA header API for portable subsystems (encodings, optimizers, non-fused networks):
+
+```cpp
+#include <tiny-cuda-nn/encodings/grid.h>
+#include <tiny-cuda-nn/network.h>
+
+// Identical call-site code as under CUDA; the MUSA build links against
+// libtiny-cuda-nn.a built by the cmake invocation above. The static library
+// already contains the MUSA kernels — no runtime backend selection needed.
+auto encoding = tcnn::create_encoding<float>(
+    /*n_dims_to_encode=*/3,
+    nlohmann::json{{"otype", "HashGrid"}, {"n_levels", 16}}
+);
+// Train loop / forward pass runs identically to the CUDA build.
+```
+
+Link command (MUSA build):
+
+```bash
+# Consumer's CMakeLists.txt — replace the CUDA find_package / add_subdirectory block:
+set(USE_MUSA ON)
+add_subdirectory(tiny-cuda-nn)        # picks up src_musa + CMakeLists_musa.txt via USE_MUSA
+target_link_libraries(your_target PRIVATE tiny-cuda-nn)
+```
+
+For users depending on `FullyFusedMLP` or `CutlassMLP`: compile your consumer code against MUSA's `libtiny-cuda-nn.a`, then instantiate the non-fused `Network` or `NetworkWithInputEncoding` class instead. These classes implement the same `tcnn::Network<T>` interface and are linked into the MUSA static lib.
+
+> Full migration record: [MUSIFY.md](MUSIFY.md)
