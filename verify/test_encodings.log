@@ -1,0 +1,121 @@
+0.047 s: Testing DenseGrid
+0.047 s: Various invariance checks for input encodings - network_precision_t
+0.033 s: `inference_mixed_precision` and `forward` match
+0.047 s: Testing DenseGrid
+0.047 s: Various invariance checks for input encodings - network_precision_t
+0.030 s: `inference` and `inference_mixed_precision` match
+0.033 s: Testing TiledGrid
+0.033 s: Various invariance checks for input encodings - network_precision_t
+0.033 s: `inference_mixed_precision` and `forward` match
+0.036 s: Testing TiledGrid
+0.036 s: Various invariance checks for input encodings - network_precision_t
+0.032 s: `inference` and `inference_mixed_precision` match
+0.038 s: Testing Grid
+0.038 s: Various invariance checks for input encodings - network_precision_t
+0.033 s: `inference_mixed_precision` and `forward` match
+0.038 s: Testing Grid
+0.038 s: Various invariance checks for input encodings - network_precision_t
+0.069 s: `inference` and `inference_mixed_precision` match
+0.076 s: Testing Frequency
+0.076 s: Various invariance checks for input encodings - network_precision_t
+0.068 s: `inference_mixed_precision` and `forward` match
+0.076 s: Testing Frequency
+0.076 s: Various invariance checks for input encodings - network_precision_t
+0.014 s: `inference` and `inference_mixed_precision` match
+0.016 s: Testing SphericalHarmonics
+0.016 s: Various invariance checks for input encodings - network_precision_t
+0.014 s: `inference_mixed_precision` and `forward` match
+0.016 s: Testing SphericalHarmonics
+0.016 s: Various invariance checks for input encodings - network_precision_t
+0.000 s: Testing Empty
+0.000 s: Various invariance checks for input encodings - network_precision_t
+0.032 s: `inference` and `inference_mixed_precision` match
+0.038 s: Testing HashGrid
+0.038 s: Various invariance checks for input encodings - network_precision_t
+0.033 s: `inference_mixed_precision` and `forward` match
+0.038 s: Testing HashGrid
+0.038 s: Various invariance checks for input encodings - network_precision_t
+0.014 s: `inference` and `inference_mixed_precision` match
+0.015 s: Testing Composite
+0.015 s: Various invariance checks for input encodings - network_precision_t
+0.014 s: `inference_mixed_precision` and `forward` match
+0.016 s: Testing Composite
+0.016 s: Various invariance checks for input encodings - network_precision_t
+0.052 s: `inference` and `inference_mixed_precision` match
+0.054 s: Testing NRC
+0.054 s: Various invariance checks for input encodings - float
+0.051 s: `inference_mixed_precision` and `forward` match
+0.053 s: Testing NRC
+0.053 s: Various invariance checks for input encodings - float
+0.039 s: `inference` and `inference_mixed_precision` match
+0.040 s: Testing TriangleWave
+0.040 s: Various invariance checks for input encodings - float
+0.039 s: `inference_mixed_precision` and `forward` match
+0.041 s: Testing TriangleWave
+0.041 s: Various invariance checks for input encodings - float
+0.038 s: `inference` and `inference_mixed_precision` match
+0.040 s: Testing OneBlob
+0.040 s: Various invariance checks for input encodings - float
+0.038 s: `inference_mixed_precision` and `forward` match
+0.040 s: Testing OneBlob
+0.040 s: Various invariance checks for input encodings - float
+0.013 s: `inference` and `inference_mixed_precision` match
+0.014 s: Testing Identity
+0.014 s: Various invariance checks for input encodings - float
+0.013 s: `inference_mixed_precision` and `forward` match
+0.014 s: Testing Identity
+0.014 s: Various invariance checks for input encodings - float
+0.051 s: `inference` and `inference_mixed_precision` match
+0.053 s: Testing OneBlobFrequency
+0.053 s: Various invariance checks for input encodings - float
+0.052 s: `inference_mixed_precision` and `forward` match
+0.054 s: Testing OneBlobFrequency
+0.054 s: Various invariance checks for input encodings - float
+0.026 s: `inference` and `inference_mixed_precision` match
+0.039 s: Testing DenseGrid
+0.040 s: Various invariance checks for input encodings - float
+0.026 s: `inference_mixed_precision` and `forward` match
+0.039 s: Testing DenseGrid
+0.039 s: Various invariance checks for input encodings - float
+0.026 s: `inference` and `inference_mixed_precision` match
+0.027 s: Testing TiledGrid
+0.027 s: Various invariance checks for input encodings - float
+0.026 s: `inference_mixed_precision` and `forward` match
+0.027 s: Testing TiledGrid
+0.027 s: Various invariance checks for input encodings - float
+0.026 s: `inference` and `inference_mixed_precision` match
+0.030 s: Testing Grid
+0.030 s: Various invariance checks for input encodings - float
+0.026 s: `inference_mixed_precision` and `forward` match
+0.030 s: Testing Grid
+0.030 s: Various invariance checks for input encodings - float
+0.067 s: `inference` and `inference_mixed_precision` match
+0.070 s: Testing Frequency
+0.070 s: Various invariance checks for input encodings - float
+0.068 s: `inference_mixed_precision` and `forward` match
+0.071 s: Testing Frequency
+0.071 s: Various invariance checks for input encodings - float
+0.013 s: `inference` and `inference_mixed_precision` match
+0.014 s: Testing SphericalHarmonics
+0.014 s: Various invariance checks for input encodings - float
+0.013 s: `inference_mixed_precision` and `forward` match
+0.014 s: Testing SphericalHarmonics
+0.014 s: Various invariance checks for input encodings - float
+0.000 s: Testing Empty
+0.000 s: Various invariance checks for input encodings - float
+0.026 s: `inference` and `inference_mixed_precision` match
+0.030 s: Testing HashGrid
+0.030 s: Various invariance checks for input encodings - float
+0.026 s: `inference_mixed_precision` and `forward` match
+0.029 s: Testing HashGrid
+0.030 s: Various invariance checks for input encodings - float
+0.013 s: `inference` and `inference_mixed_precision` match
+0.014 s: Testing Composite
+0.014 s: Various invariance checks for input encodings - float
+0.013 s: `inference_mixed_precision` and `forward` match
+0.014 s: Testing Composite
+0.014 s: Various invariance checks for input encodings - float
+===============================================================================
+All tests passed (47186016 assertions in 2 test cases)
+
+EXIT:0

@@ -1,0 +1,103 @@
+issue:
+  id: "tiny-cuda-nn-001"
+  timestamp: "2026-04-21T03:34:23+00:00"
+  source: director
+  type: porting-gap
+  severity: cosmetic
+  status: open
+
+  # --- Search Keys ---
+  search_keys:
+    error_type: null
+    error_category: porting-error
+    kernel_name: null
+    kernel_family: null
+    library: mcc
+    application: "tiny-cuda-nn"
+    dimensions: null
+    data_types: null
+
+  # --- Environment ---
+  environment:
+    run_target: container
+    sdk_version: "5.1.0"
+    driver_version: null
+    gpu_model: MTT S5000
+    gpu_arch: ph1
+    container_image: null
+
+  # --- Reproduction ---
+  error_message: "FullyFusedMLP / CutlassMLP / RTCKernel unavailable on MUSA — hardware/SDK gap (no wmma+PTX, no CUTLASS SM backend, no NVRTC)"
+  command: "<TODO: musifier to audit #ifdef gating of stubs and re-run test_encodings + test_grid>"
+  file: null
+  log_excerpt: |
+    > Auto-generated from the 2026-04-21 `auto-musify` group status survey.
+
+    ## Status
+    **Incomplete** — last MUSIFY.md update: `2026-03-25` (branch: `musa`)
+
+    ## Behavior observed
+    - `FullyFusedMLP` unavailable — no wmma/PTX equivalent in MUSA (wontfix).
+    - `CutlassMLP` unavailable — CUTLASS is NVIDIA SM-specific (wontfix).
+    - `RTCKernel` unavailable — no MUSA NVRTC equivalent (wontfix).
+
+    ## Impact
+    - tiny-cuda-nn's headline high-performance MLP implementations are all unavailable on MUSA.
+    - Only non-fused / non-CUTLASS code paths work — significant perf degradation for NeRF-style workloads.
+
+    ## Suggested next action
+    _Wontfix — hardware/SDK gap fundamental, no upstream path (wmma/PTX + NVRTC)_
+
+  # --- Resolution ---
+  rootcause:
+    status: suspected
+    description: "Three independent MUSA hardware/SDK gaps: (1) FullyFusedMLP requires NVIDIA wmma PTX tensor-core asm — no MUSA equivalent intrinsic; (2) CutlassMLP depends on vendored NVIDIA CUTLASS (NVIDIA SM architecture specific); (3) RTCKernel/CudaRtcKernel requires NVRTC JIT — no MUSA NVRTC. Prior MUSIFY.md already gates each via #ifdef TCNN_FULLY_FUSED_MLP / #ifdef TCNN_RTC stubs and excludes cutlass_mlp.mu from the MUSA build."
+    category: missing-op
+    component: musa-runtime
+
+  solution:
+    status: wontfix
+    description: "Fundamental MUSA hardware/SDK gap — no upstream path for any of the three subsystems at SDK 5.1.0. Portable paths (encodings, optimizers, basic networks) verified passing 47M assertions on S5000 at SDK 4.3.6. Confirm gating + audit stubs on SDK 5.1.0; leave as documented limitation."
+    fix_type: file-jira
+    fix_version: null
+    fix_reference: null
+    contact: null
+
+  jira_refs: []
+
+  # --- Jira Registration ---
+  aum_key: null
+
+  # --- History ---
+  attempted: []
+
+  # --- Upstream reference (fix-issues extension) ---
+  upstream_ref:
+    platform: gitlab
+    host: "sh-gitlab.mthreads.com"
+    project: "auto-musify/tiny-cuda-nn"
+    url: "https://sh-gitlab.mthreads.com/auto-musify/tiny-cuda-nn/-/issues/1"
+    number: 1
+    reporter: "jing.feng"
+    reporter_name: "FengJing"
+    created_at: "2026-04-21T11:26:55+08:00"
+    labels:
+      - auto-musify
+      - musa-port
+      - status::incomplete
+    cluster_id: "cluster-001"
+    severity_9level: "S7"
+    subsystems:
+      - name: "FullyFusedMLP"
+        file: "src_musa/fully_fused_mlp.mu"
+        guard: "TCNN_FULLY_FUSED_MLP"
+        gap: "no wmma PTX tensor-core asm on MUSA"
+      - name: "CutlassMLP"
+        file: "src_musa/cutlass_mlp.mu"
+        guard: "(excluded from MUSA build)"
+        gap: "CUTLASS is NVIDIA SM-specific"
+      - name: "RTCKernel / CudaRtcKernel"
+        file: "src_musa/rtc_kernel.mu, src_musa/cuda_rtc_kernel_stub.cpp"
+        guard: "TCNN_RTC"
+        gap: "no MUSA NVRTC"
+    fix_strategy: "Audit-only: musifier confirms each subsystem is correctly #ifdef-gated on SDK 5.1.0 and compiles clean without them; verifier re-runs test_encodings + test_grid on portable paths; publish BLOCKED template reply to upstream issue #1. Do not fabricate fixes (CLAUDE.md Rule 4)."

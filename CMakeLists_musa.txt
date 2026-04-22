@@ -50,6 +50,7 @@ set(TCNN_DEFINITIONS
     -DTCNN_MIN_GPU_ARCH=21        # mp_21 = S5000
     -DTCNN_HALF_PRECISION=1
     -DTCNN_NO_FULLY_FUSED_MLP     # disable wmma code paths
+    -DFMT_USE_FLOAT128=0          # SDK 5.1.0 (Round 1): mcc mp_31 rejects __float128
     # TCNN_RTC not defined         # disable NVRTC code paths
     # TCNN_SHAMPOO not defined      # disable cuBLAS/cuSolver Shampoo optimizer
 )

@@ -41,8 +41,7 @@
 
 namespace tcnn {
 
-// MUSA port: version check updated for MUSA SDK (version 4.x, not CUDA versioning)
-static_assert(__MUSACC_VER_MAJOR__ >= 4, "tiny-cuda-nn requires at least MUSA SDK 4.0");
+static_assert(__MUSACC_VER_MAJOR__ >= 4, "tiny-cuda-nn requires at least CUDA 10.2");
 
 std::function<void(LogSeverity, const std::string&)> g_log_callback = [](LogSeverity severity, const std::string& msg) {
 	switch (severity) {
@@ -202,27 +201,27 @@ std::string to_string(ReductionType reduction_type) {
 
 int cuda_runtime_version() {
 	int version;
-	MUSA_CHECK_THROW(musaRuntimeGetVersion(&version));
+	CUDA_CHECK_THROW(musaRuntimeGetVersion(&version));
 	return version;
 }
 
 int cuda_device() {
 	int device;
-	MUSA_CHECK_THROW(musaGetDevice(&device));
+	CUDA_CHECK_THROW(musaGetDevice(&device));
 	return device;
 }
 
-void set_cuda_device(int device) { MUSA_CHECK_THROW(musaSetDevice(device)); }
+void set_cuda_device(int device) { CUDA_CHECK_THROW(musaSetDevice(device)); }
 
 int cuda_device_count() {
 	int device_count;
-	MUSA_CHECK_THROW(musaGetDeviceCount(&device_count));
+	CUDA_CHECK_THROW(musaGetDeviceCount(&device_count));
 	return device_count;
 }
 
 bool cuda_supports_virtual_memory(int device) {
 	int supports_vmm;
-	MU_CHECK_THROW(muDeviceGetAttribute(&supports_vmm, MU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED, device));
+	CU_CHECK_THROW(muDeviceGetAttribute(&supports_vmm, MU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED, device));
 	return supports_vmm != 0;
 }
 
@@ -234,7 +233,7 @@ std::unordered_map<int, musaDeviceProp>& cuda_device_properties() {
 const musaDeviceProp& cuda_get_device_properties(int device) {
 	if (cuda_device_properties().count(device) == 0) {
 		auto& props = cuda_device_properties()[device];
-		MUSA_CHECK_THROW(musaGetDeviceProperties(&props, device));
+		CUDA_CHECK_THROW(musaGetDeviceProperties(&props, device));
 	}
 
 	return cuda_device_properties().at(device);
@@ -280,13 +279,13 @@ size_t cuda_memory_granularity(int device) {
 	if (granularity_result == MUSA_ERROR_NOT_SUPPORTED) {
 		return 1;
 	}
-	MU_CHECK_THROW(granularity_result);
+	CU_CHECK_THROW(granularity_result);
 	return granularity;
 }
 
 MemoryInfo cuda_memory_info() {
 	MemoryInfo info;
-	MUSA_CHECK_THROW(musaMemGetInfo(&info.free, &info.total));
+	CUDA_CHECK_THROW(musaMemGetInfo(&info.free, &info.total));
 	info.used = info.total - info.free;
 	return info;
 }
