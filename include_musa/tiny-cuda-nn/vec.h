@@ -871,8 +871,11 @@ TCNN_HOST_DEVICE tmat<T, N, N> inverse(const tmat<T, N, N>& m) {
 
 template <typename T, size_t A>
 TCNN_HOST_DEVICE tmat<T, 3, 3> rotmat(T angle, const tvec<T, 3, A>& axis) {
-	T s, c;
-	sincos(angle, &s, &c);
+	// MUSA / libc has no sincos(float,...) — only sincos(double,...) and
+	// sincosf(float,...). Call sin/cos individually; mcc's optimizer will
+	// fuse them back into sincos where beneficial.
+	T s = std::sin(angle);
+	T c = std::cos(angle);
 	T oc = (T)1 - c;
 
 	return {

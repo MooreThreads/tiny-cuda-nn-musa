@@ -8,6 +8,23 @@
 #include <musa.h>
 #include <tiny-cuda-nn/rtc_kernel.h>
 
+// ngp / tcnn both call `all_files(cmrc::embedded_filesystem&, const std::string&)`
+// unconditionally — only under `if (m_jit_fusion)` at runtime, but linker
+// needs the symbol. Since supports_jit_fusion() returns false on MUSA, the
+// function is never actually invoked; return empty.
+#include <cmrc/cmrc.hpp>
+
+namespace tcnn {
+
+std::vector<std::pair<std::string, const char*>> all_files(
+    const cmrc::embedded_filesystem& /*fs*/,
+    const std::string& /*dir*/)
+{
+    return {};
+}
+
+} // namespace tcnn
+
 namespace tcnn {
 
 bool supports_jit_fusion(int /*device*/) {
