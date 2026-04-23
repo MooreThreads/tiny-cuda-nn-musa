@@ -1,6 +1,7 @@
-// MUSA stub: CudaRtcKernel -- provides link stubs when TCNN_RTC is not defined.
-// Compiled as plain C++ (not .mu) to avoid musa_add_library cmake configure-time
-// compilation issues (which run before _cmrc headers are generated).
+// MUSA stub: CudaRtcKernel + all_files -- link stubs when TCNN_RTC is off.
+// Compiled as plain C++ (not .mu) so cmake/build-tree configure order works
+// (runs before cmrc codegen).
+
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -8,10 +9,7 @@
 #include <musa.h>
 #include <tiny-cuda-nn/rtc_kernel.h>
 
-// ngp / tcnn both call `all_files(cmrc::embedded_filesystem&, const std::string&)`
-// unconditionally — only under `if (m_jit_fusion)` at runtime, but linker
-// needs the symbol. Since supports_jit_fusion() returns false on MUSA, the
-// function is never actually invoked; return empty.
+// cmrc is vendored header-only at dependencies/cmrc/include/cmrc/cmrc.hpp
 #include <cmrc/cmrc.hpp>
 
 namespace tcnn {
