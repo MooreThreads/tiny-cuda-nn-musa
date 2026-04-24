@@ -75,6 +75,35 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/dependencies/cmrc/CMakeRC.cmake")
 cmrc_add_resource_library(tiny-cuda-nn-resources NAMESPACE tcnn)
 set(TCNN_DEFINITIONS ${TCNN_DEFINITIONS} -DTCNN_CMRC)
 
+# ── Round 6 (issue instant-ngp-007): populate the cmrc bundle.
+# Upstream CUDA CMakeLists.txt:373-378 bundles tcnn `include/tiny-cuda-nn/*`,
+# CUDA FP16 headers, and pcg32; the original MUSA port created the bundle but
+# never populated it, so `mtrtcCompileProgram` arrived at the preprocessor
+# with zero in-memory headers and `#include <tiny-cuda-nn/ministd.h>`
+# fatal-errored.
+#
+# MUSA equivalent: bundle `include_musa/tiny-cuda-nn/*` (the ported headers
+# tcnn JIT needs to resolve at run time), pcg32, and MUSA FP16 / vector
+# headers from /usr/local/musa/include (the counterpart of upstream's CUDA
+# FP16 bundling). The headers are embedded in the static library and
+# surface via `all_files(cmrc::tcnn::get_filesystem())` at JIT time.
+file(GLOB_RECURSE TCNN_MUSA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/include_musa/tiny-cuda-nn/*")
+file(GLOB         PCG32_HEADERS     "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/pcg32/*")
+file(GLOB         MUSA_RTC_HEADERS  "/usr/local/musa/include/musa_fp16*"
+                                    "/usr/local/musa/include/vector_types.h"
+                                    "/usr/local/musa/include/vector_functions.h"
+                                    "/usr/local/musa/include/vector_functions.hpp"
+                                    "/usr/local/musa/include/mma.h")
+cmrc_add_resources(tiny-cuda-nn-resources
+    WHENCE "${CMAKE_CURRENT_SOURCE_DIR}/include_musa"
+    ${TCNN_MUSA_HEADERS})
+cmrc_add_resources(tiny-cuda-nn-resources
+    WHENCE "${CMAKE_CURRENT_SOURCE_DIR}/dependencies"
+    ${PCG32_HEADERS})
+cmrc_add_resources(tiny-cuda-nn-resources
+    WHENCE "/usr/local/musa/include"
+    ${MUSA_RTC_HEADERS})
+
 # ── Build the library ──────────────────────────────────────────────────────────
 musa_add_library(tiny-cuda-nn STATIC ${TCNN_SOURCES})
 target_compile_definitions(tiny-cuda-nn PUBLIC ${TCNN_DEFINITIONS})
