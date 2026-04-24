@@ -89,12 +89,19 @@ namespace tcnn {
 
 // Pick an mtrtc --gpu-architecture tag. mtrtc accepts {mp_10, mp_21, mp_22,
 // mp_31}. Map the MUSA device's (major, minor) compute capability to the
-// nearest supported mp tag. S5000 = (2,1); S4000 = (2,2); future PH2 = (3,1).
+// nearest supported mp tag. Observed at runtime on SDK 5.1.0:
+//   S5000 → (3,1) → mp_31   (PH1 — was (2,1) under older SDKs; bumped)
+//   S4000 → (2,2) → mp_22   (QY2)
+//   S90   → (2,2) → mp_22   (QY2)
+// The mapping is device-driven — do NOT hardcode per build-time
+// `--offload-arch` choice; mtrtc JIT and mcc static-compile can legitimately
+// differ (see Round 7 issue-007 handoff).
 static std::string musa_mtrtc_arch_for_device(int device) {
 	musaDeviceProp prop{};
 	if (musaGetDeviceProperties(&prop, device) != musaSuccess) {
-		// Fall back to mp_21 (S5000 / PH1 — the round-2 target).
-		return "mp_21";
+		// Fall back to mp_31 — SDK 5.1.0's canonical PH1 JIT arch. Older
+		// SDKs where S5000 reported (2,1) are out of support scope.
+		return "mp_31";
 	}
 	int code = prop.major * 10 + prop.minor;
 	switch (code) {
