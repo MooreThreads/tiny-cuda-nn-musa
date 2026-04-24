@@ -27,22 +27,25 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ── Sources (encodings-only: exclude wmma and nvrtc) ─────────────────────────
-# NOTE: cuda_rtc_kernel_stub.cpp is plain CXX -- handled separately below,
-#       NOT here (musa_add_library silently drops plain .cpp sources)
+# ── Sources ──────────────────────────────────────────────────────────────────
+# Round 2: cutlass_mlp.mu + rtc_kernel.mu enabled via MUSA-native backings
+#   cutlass_mlp.mu        — muBLAS shim (include_musa/tiny-cuda-nn/cutlass_matmul.h)
+#   rtc_kernel.mu         — mtrtc + muModuleLoadFatBinary
+#   fully_fused_mlp.mu    — still excluded; needs nvcuda::wmma → mma equivalent
+#                           (scheduled as a narrower follow-up; blocked on
+#                            mcc WMMA overload availability verification)
 set(TCNN_SOURCES
     src_musa/common_host.mu
     src_musa/cpp_api.mu
+    src_musa/cutlass_mlp.mu       # Round 2: real port via muBLAS shim
     src_musa/encoding.mu
     src_musa/loss.mu
     src_musa/network.mu
     src_musa/object.mu
     src_musa/optimizer.mu
     src_musa/reduce_sum.mu
-    # cutlass_mlp.mu excluded: depends on vendored CUTLASS (NVIDIA SM archs)
+    src_musa/rtc_kernel.mu        # Round 2: nvrtc → mtrtc + fatbin module-load
     # fully_fused_mlp.mu excluded: depends on nvcuda::wmma PTX
-    # cuda_rtc_kernel_stub.cpp excluded from musa_add_library -- see tcnn-rtc-stub below
-    # rtc_kernel.mu excluded: see cuda_rtc_kernel_stub.cpp instead
 )
 
 # ── Definitions ───────────────────────────────────────────────────────────────
@@ -51,7 +54,7 @@ set(TCNN_DEFINITIONS
     -DTCNN_HALF_PRECISION=1
     -DTCNN_NO_FULLY_FUSED_MLP     # disable wmma code paths
     -DFMT_USE_FLOAT128=0          # SDK 5.1.0 (Round 1): mcc mp_31 rejects __float128
-    # TCNN_RTC not defined         # disable NVRTC code paths
+    -DTCNN_RTC                    # Round 2: enable runtime compilation via mtrtc
     # TCNN_SHAMPOO not defined      # disable cuBLAS/cuSolver Shampoo optimizer
 )
 
@@ -76,21 +79,15 @@ set(TCNN_DEFINITIONS ${TCNN_DEFINITIONS} -DTCNN_CMRC)
 musa_add_library(tiny-cuda-nn STATIC ${TCNN_SOURCES})
 target_compile_definitions(tiny-cuda-nn PUBLIC ${TCNN_DEFINITIONS})
 target_include_directories(tiny-cuda-nn PUBLIC ${TCNN_INCLUDES})
-target_link_libraries(tiny-cuda-nn fmt tiny-cuda-nn-resources)
-
-# ── RTC stub (plain CXX -- bypass musa_add_library limitation) ─────────────────
-# musa_add_library silently drops plain .cpp sources; use a separate add_library.
-# Strip -D prefix from definitions (target_compile_definitions does not use -D).
-# Link fmt to get fmt/format.h include path.
-add_library(tcnn-rtc-stub STATIC src_musa/cuda_rtc_kernel_stub.cpp)
-target_include_directories(tcnn-rtc-stub PUBLIC ${TCNN_INCLUDES})
-target_compile_definitions(tcnn-rtc-stub PUBLIC
-    TCNN_MIN_GPU_ARCH=21
-    TCNN_HALF_PRECISION=1
-    TCNN_NO_FULLY_FUSED_MLP
-    TCNN_CMRC
+# Round 2: link mublas (CUTLASS shim backend) + mtrtc (JIT) + musart/musa driver.
+target_link_libraries(tiny-cuda-nn
+    fmt
+    tiny-cuda-nn-resources
+    mublas
+    mtrtc
+    musart
+    musa
 )
-target_link_libraries(tcnn-rtc-stub fmt)
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if (TCNN_BUILD_TESTS)

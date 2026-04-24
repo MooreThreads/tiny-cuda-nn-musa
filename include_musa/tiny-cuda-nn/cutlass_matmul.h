@@ -1,432 +1,247 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * BSD 3-clause — see original cutlass_matmul.h header.
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * MUSA port (auto-musify round 2):
+ *   muBLAS-backed reimplementation of tcnn's cutlass_matmul.h API surface —
+ *   specifically, the fc_multiply and fc_multiply_split_k function templates
+ *   consumed by cutlass_mlp.cu / fully_fused_mlp.cu.
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-/** @file   cutlass_matmul.h
- *  @author Thomas Müller, NVIDIA
- *  @brief  Matrix multiplication wrappers that call into CUTLASS (plus some custom modifications).
- *          The parameters are optimized to give optimal performance in a variety of situations.
- *          Parts of this file were adapted by starting from the CUTLASS sample code (see its BSD 3-clause license).
+ *   Why muBLAS (not mutlass):
+ *     - MooreThreads mutlass (https://github.com/MooreThreads/mutlass) is
+ *       built on CuTe (CUTLASS 3.x). Its public entry is
+ *       cutlass::gemm::device::GemmUniversalAdapter.
+ *     - tcnn's cutlass_matmul.h targets the CUTLASS 2.x API:
+ *       cutlass::gemm::device::Gemm + GemmSplitKParallel. These classes
+ *       do not exist in mutlass (verified via wiki + upstream README).
+ *     - The verified pattern from the MUSA bugfix-library-deps wiki (Fix #1,
+ *       validated in the MNN port) is to expose tcnn's narrow CUTLASS 2.x
+ *       surface via a muBLAS-backed shim. This file is that shim.
+ *
+ *   Scope: only fc_multiply / fc_multiply_split_k are implemented. The rest
+ *   of cutlass_matmul.h's machinery (epilogue templates, SmArch tags,
+ *   GemmShape types) is collapsed into runtime arguments here.
+ *
+ *   Rule-3 parallel-folder porting: original cutlass_matmul.h (CUDA/CUTLASS)
+ *   remains untouched under include/; this file under include_musa/ is the
+ *   MUSA replacement.
  */
 
 #pragma once
 
 #include <tiny-cuda-nn/common.h>
-
-#include <tiny-cuda-nn/gpu_matrix.h>
 #include <tiny-cuda-nn/common_device.h>
+#include <tiny-cuda-nn/gpu_matrix.h>
+#include <tiny-cuda-nn/network.h>  // activation_gpu / activation_backward_gpu
 
-#include <cutlass/cutlass.h>
+#include <mublas.h>
+#include <musa_runtime.h>
+#include <musa_fp16.h>
 
-#include <cutlass/array.h>
-#include <cutlass/functional.h>
-#include <cutlass/gemm/device/gemm.h>
-#include <cutlass/gemm/device/gemm_splitk_parallel.h>
-#include <cutlass/numeric_conversion.h>
-#include <cutlass/numeric_types.h>
-
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 
 namespace tcnn {
 
-#define CUTLASS_CHECK_THROW(x)                                                                                               \
-	do {                                                                                                                     \
-		cutlass::Status _result = x;                                                                                         \
-		if (_result != cutlass::Status::kSuccess)                                                                            \
-			throw std::runtime_error(std::string(FILE_LINE " " #x " failed with error ") + cutlassGetStatusString(_result)); \
-	} while(0)
+// ─────────────────────────────────────────────────────────────────────────────
+// mublas error helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
-using SmArch = std::conditional_t<MIN_GPU_ARCH >= 80,
-	std::conditional_t<std::is_same<network_precision_t, float>::value, cutlass::arch::Sm75, cutlass::arch::Sm80>,
-	std::conditional_t<MIN_GPU_ARCH >= 75,
-		cutlass::arch::Sm75,
-		cutlass::arch::Sm70
-	>
->;
-
-using TypeAccumulator = std::conditional_t<std::is_same<network_precision_t, float>::value, float, cutlass::half_t>;
-using TypeCompute = std::conditional_t<std::is_same<network_precision_t, float>::value, float, cutlass::half_t>;
-
-template <typename T>
-using MMAOp = typename std::conditional<
-	std::is_same<T, float>::value || MIN_GPU_ARCH < 70,
-	cutlass::arch::OpClassSimt,
-	cutlass::arch::OpClassTensorOp
->::type;
-
-template <typename T>
-using ShapeMMAOp = typename std::conditional<
-	std::is_same<MMAOp<T>, cutlass::arch::OpClassTensorOp>::value,
-	typename std::conditional<
-		std::is_same<SmArch, cutlass::arch::Sm80>::value || std::is_same<SmArch, cutlass::arch::Sm75>::value,
-		cutlass::gemm::GemmShape<16, 8, 8>,
-		cutlass::gemm::GemmShape<8, 8, 4>
-	>::type,
-	cutlass::gemm::GemmShape<1, 1, 1>
->::type;
-
-template <typename thread_block, typename warp>
-struct LayerConfig {
-	using k_thread_block = thread_block;
-	using k_warp = warp;
-};
-
-using FullLayerK = typename std::conditional<
-	std::is_same<MMAOp<network_precision_t>, cutlass::arch::OpClassSimt>::value,
-	LayerConfig<cutlass::gemm::GemmShape<128, 128, 8>, cutlass::gemm::GemmShape<32, 64, 8>>,
-	LayerConfig<cutlass::gemm::GemmShape<64, 64, 32>, cutlass::gemm::GemmShape<32, 32, 32>>
->::type;
-using LastLayerK = FullLayerK;
-
-using FullLayer = typename std::conditional<
-	std::is_same<MMAOp<network_precision_t>, cutlass::arch::OpClassSimt>::value,
-	LayerConfig<cutlass::gemm::GemmShape<128, 128, 8>, cutlass::gemm::GemmShape<32, 64, 8>>,
-	LayerConfig<cutlass::gemm::GemmShape<128, 128, 32>, cutlass::gemm::GemmShape<64, 64, 32>>
->::type;
-using LastLayer = FullLayer;
-
-// This code section describes how threadblocks are scheduled on GPU
-using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
-
-// This code section describes the epilogue part of the kernel
-
-template <typename V>
-struct CutlassFragmentWrapper {
-	static const uint32_t num_elements = V::kElements;
-	V x;
-};
-
-template <
-	typename ElementOutput_,                             ///< Data type used to load and store tensors
-	int Count,                                           ///< Number of elements computed per operation
-	typename ElementAccumulator_ = ElementOutput_,       ///< Accumulator data type
-	typename ElementCompute_ = ElementOutput_,           ///< Data type used to compute linear combination
-	cutlass::FloatRoundStyle Round = cutlass::FloatRoundStyle::round_to_nearest
->
-class ActivationEpilogue {
-public:
-	using ElementOutput = ElementOutput_;
-	using ElementAccumulator = ElementAccumulator_;
-	using ElementCompute = ElementCompute_;
-
-	static int const kCount = Count;
-
-	using FragmentOutput = cutlass::Array<ElementOutput, kCount>;
-	using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
-	using ComputeFragment = cutlass::Array<ElementCompute, kCount>;
-
-	static cutlass::FloatRoundStyle const kRound = Round;
-
-	struct Params {
-		Activation activation;
-		bool sum_source;
-	};
-
-public:
-	CUTLASS_HOST_DEVICE
-	ActivationEpilogue(Params const &params) : m_activation{params.activation}, m_sum_source{params.sum_source} { }
-
-	CUTLASS_HOST_DEVICE
-	bool is_source_needed() const {
-		return m_sum_source;
+inline const char* mublas_get_status_string(mublasStatus_t s) {
+	switch (s) {
+		case MUBLAS_STATUS_SUCCESS:          return "MUBLAS_STATUS_SUCCESS";
+		case MUBLAS_STATUS_NOT_INITIALIZED:  return "MUBLAS_STATUS_NOT_INITIALIZED";
+		case MUBLAS_STATUS_ALLOC_FAILED:     return "MUBLAS_STATUS_ALLOC_FAILED";
+		case MUBLAS_STATUS_INVALID_VALUE:    return "MUBLAS_STATUS_INVALID_VALUE";
+		case MUBLAS_STATUS_ARCH_MISMATCH:    return "MUBLAS_STATUS_ARCH_MISMATCH";
+		case MUBLAS_STATUS_MAPPING_ERROR:    return "MUBLAS_STATUS_MAPPING_ERROR";
+		case MUBLAS_STATUS_EXECUTION_FAILED: return "MUBLAS_STATUS_EXECUTION_FAILED";
+		case MUBLAS_STATUS_INTERNAL_ERROR:   return "MUBLAS_STATUS_INTERNAL_ERROR";
+		case MUBLAS_STATUS_NOT_SUPPORTED:    return "MUBLAS_STATUS_NOT_SUPPORTED";
+		default:                             return "MUBLAS_STATUS_unknown";
 	}
-
-	/// Functionally required for serial reduction in the epilogue
-	CUTLASS_HOST_DEVICE
-	void set_k_partition(int k_partition, int k_partition_count) { }
-
-	CUTLASS_HOST_DEVICE
-	FragmentOutput operator()(FragmentAccumulator const &accumulator) const {
-		cutlass::NumericArrayConverter<ElementCompute, ElementAccumulator, kCount, Round> accumulator_converter;
-
-		auto intermediate = CutlassFragmentWrapper<ComputeFragment>{accumulator_converter(accumulator)};
-		intermediate = warp_activation<ElementCompute>(m_activation, intermediate);
-
-		cutlass::NumericArrayConverter<ElementOutput, ElementCompute, kCount, Round> destination_converter;
-		return destination_converter(intermediate.x);
-	}
-
-	CUTLASS_HOST_DEVICE
-	FragmentOutput operator()(FragmentAccumulator const &accumulator, FragmentOutput const &source) const {
-		cutlass::NumericArrayConverter<ElementCompute, ElementOutput, kCount, Round> source_converter;
-		cutlass::NumericArrayConverter<ElementCompute, ElementAccumulator, kCount, Round> accumulator_converter;
-
-		cutlass::plus<ComputeFragment> plus_op;
-		auto intermediate = CutlassFragmentWrapper<ComputeFragment>{accumulator_converter(accumulator)};
-		if (m_sum_source) {
-			intermediate.x = plus_op(intermediate.x, source_converter(source));
-		}
-		intermediate = warp_activation<ElementCompute>(m_activation, intermediate);
-
-		cutlass::NumericArrayConverter<ElementOutput, ElementCompute, kCount, Round> destination_converter;
-		return destination_converter(intermediate.x);
-	}
-
-private:
-	Activation m_activation;
-	bool m_sum_source;
-};
-
-template <
-	typename ElementOutput_,                             ///< Data type used to load and store tensors
-	int Count,                                           ///< Number of elements computed per operation
-	typename ElementAccumulator_ = ElementOutput_,       ///< Accumulator data type
-	typename ElementCompute_ = ElementOutput_,           ///< Data type used to compute linear combination
-	cutlass::FloatRoundStyle Round = cutlass::FloatRoundStyle::round_to_nearest
->
-class ActivationTransferEpilogue {
-public:
-	using ElementOutput = ElementOutput_;
-	using ElementAccumulator = ElementAccumulator_;
-	using ElementCompute = ElementCompute_;
-
-	static int const kCount = Count;
-
-	using FragmentOutput = cutlass::Array<ElementOutput, kCount>;
-	using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
-	using ComputeFragment = cutlass::Array<ElementCompute, kCount>;
-
-	static cutlass::FloatRoundStyle const kRound = Round;
-
-	/// Host-constructable parameters structure
-	struct Params {
-		Activation activation;
-	};
-
-public:
-	/// Constructs the function object, possibly loading from pointers in host memory
-	CUTLASS_HOST_DEVICE
-	ActivationTransferEpilogue(Params const &params) : m_activation{params.activation} { }
-
-	/// Returns true if source is needed
-	CUTLASS_HOST_DEVICE
-	bool is_source_needed() const {
-		return true;
-	}
-
-	/// Functionally required for serial reduction in the epilogue
-	CUTLASS_HOST_DEVICE
-	void set_k_partition(int k_partition, int k_partition_count) { }
-
-	CUTLASS_HOST_DEVICE
-	FragmentOutput operator()(
-		FragmentAccumulator const &accumulator,
-		FragmentOutput const &source) const {
-
-		cutlass::NumericArrayConverter<ElementCompute, ElementOutput, kCount, Round> source_converter;
-		cutlass::NumericArrayConverter<ElementCompute, ElementAccumulator, kCount, Round> accumulator_converter;
-
-		auto converted_source = CutlassFragmentWrapper<ComputeFragment>{source_converter(source)};
-		auto intermediate = CutlassFragmentWrapper<ComputeFragment>{accumulator_converter(accumulator)};
-
-		intermediate = warp_activation_backward<ElementCompute>(m_activation, intermediate, converted_source);
-
-		cutlass::NumericArrayConverter<ElementOutput, ElementCompute, kCount, Round> destination_converter;
-		return destination_converter(intermediate.x);
-	}
-
-	CUTLASS_HOST_DEVICE
-	FragmentOutput operator()(
-		FragmentAccumulator const &accumulator) const {
-
-		cutlass::NumericArrayConverter<ElementCompute, ElementAccumulator, kCount, Round> accumulator_converter;
-
-		ComputeFragment converted_accumulator = accumulator_converter(accumulator);
-
-		cutlass::NumericArrayConverter<ElementOutput, ElementCompute, kCount, Round> destination_converter;
-
-		return destination_converter(converted_accumulator);
-	}
-
-private:
-	Activation m_activation;
-};
-
-
-template <typename T>
-static constexpr int n_vectorized_elements = std::is_same<MMAOp<T>, cutlass::arch::OpClassTensorOp>::value ? (128 / cutlass::sizeof_bits<T>::value) : 1;
-
-template <typename T>
-using SumOp = cutlass::epilogue::thread::LinearCombination<T, n_vectorized_elements<T>, TypeAccumulator, TypeCompute>;
-
-template <typename T>
-using ActivationOp = ActivationEpilogue<T, n_vectorized_elements<T>, TypeAccumulator, TypeCompute>;
-
-template <typename T>
-using ActivationTransferOp = ActivationTransferEpilogue<T, n_vectorized_elements<T>, TypeAccumulator, TypeCompute>;
-
-
-template <typename EPILOGUE, typename LayerConfig, typename TypeA, typename LayoutA, typename TypeB, typename LayoutB, typename TypeOutput, typename LayoutOutput>
-using OurGemm = cutlass::gemm::device::Gemm<
-	TypeA,
-	LayoutA,
-	TypeB,
-	LayoutB,
-	TypeOutput,
-	LayoutOutput,
-	TypeAccumulator,
-	MMAOp<TypeA>,
-	SmArch,
-	typename LayerConfig::k_thread_block,
-	typename LayerConfig::k_warp,
-	ShapeMMAOp<TypeA>,
-	EPILOGUE,
-	SwizzleThreadBlock,
-	2
->;
-
-template <typename EPILOGUE, typename LayerConfig, typename TypeA, typename LayoutA, typename TypeB, typename LayoutB, typename TypeOutput, typename LayoutOutput>
-using SplitKGemm = cutlass::gemm::device::GemmSplitKParallel<
-	TypeA,
-	LayoutA,
-	TypeB,
-	LayoutB,
-	TypeOutput,
-	LayoutOutput,
-	TypeAccumulator,
-	MMAOp<TypeA>,
-	SmArch,
-	typename LayerConfig::k_thread_block,
-	typename LayerConfig::k_warp,
-	ShapeMMAOp<TypeA>,
-	EPILOGUE
->;
-
-template <class Gemm>
-void fc_multiply_impl(musaStream_t stream, const typename Gemm::Arguments& args) {
-	// Using the arguments, query for extra workspace required for matrix multiplication computation
-	size_t workspace_size = Gemm::get_workspace_size(args);
-
-	// Instantiate CUTLASS kernel depending on templates
-	Gemm gemm_op;
-
-	// Initialize CUTLASS kernel with arguments and workspace pointer
-	auto workspace = allocate_workspace(stream, workspace_size);
-	cutlass::Status status = gemm_op.initialize(args, workspace.data(), stream);
-	CUTLASS_CHECK_THROW(status);
-
-	// Launch initialized CUTLASS kernel
-	status = gemm_op(stream);
-	CUTLASS_CHECK_THROW(status);
 }
 
-template <class Gemm>
-void fc_multiply_split_k_impl(musaStream_t stream, const typename Gemm::Arguments& args) {
-	// Using the arguments, query for extra workspace required for matrix multiplication computation
-	size_t workspace_size = Gemm::get_workspace_size(args);
+#define MUBLAS_CHECK_THROW(x)                                                                                             \
+	do {                                                                                                                    \
+		mublasStatus_t _result = (x);                                                                                         \
+		if (_result != MUBLAS_STATUS_SUCCESS)                                                                                 \
+			throw std::runtime_error{std::string(FILE_LINE " " #x " failed with ") + mublas_get_status_string(_result)};     \
+	} while (0)
 
-	// Instantiate CUTLASS kernel depending on templates
-	Gemm gemm_op;
-
-	// Initialize CUTLASS kernel with arguments and workspace pointer
-	auto workspace = allocate_workspace(stream, workspace_size);
-	cutlass::Status status = gemm_op.initialize(args, workspace.data());
-	CUTLASS_CHECK_THROW(status);
-
-	// Launch initialized CUTLASS kernel
-	status = gemm_op(stream);
-	CUTLASS_CHECK_THROW(status);
+// Process-wide mublas handle. muBLAS is documented thread-safe: one handle
+// across multiple streams is fine; mublasCreate/Destroy cost is
+// amortized once.
+inline mublasHandle_t& tcnn_mublas_handle() {
+	static mublasHandle_t handle = nullptr;
+	static std::once_flag once;
+	std::call_once(once, [] {
+		MUBLAS_CHECK_THROW(mublasCreate(&handle));
+	});
+	return handle;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Row-major trick: muBLAS is column-major. To compute row-major C = A @ B we
+// issue mublas( op_B, op_A, N, M, K, B, ldb, A, lda, C, ldc ) which
+// column-major-computes (B^T @ A^T)^T = A @ B in row-major storage.
+// A matrix stored row-major with logical (rows m, cols n, stride s) looks
+// like a column-major (n x m, stride s) "implicit-transposed" matrix to
+// mublas, so its mublas op is MUBLAS_OP_T; column-major stays MUBLAS_OP_N.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <typename T, MatrixLayout Layout>
+static inline mublasOperation_t _mublas_op(const GPUMatrix<T, Layout>& /*M*/) {
+	return Layout == RM ? MUBLAS_OP_T : MUBLAS_OP_N;
+}
+
+template <typename T, MatrixLayout Layout>
+static inline int _mublas_ld(const GPUMatrix<T, Layout>& M) {
+	return (int)M.stride();
+}
+
+// half-precision GEMM path (used when network_precision_t == __half)
+static inline void _fc_mublas_gemm(
+	musaStream_t stream,
+	mublasOperation_t opA, mublasOperation_t opB,
+	int M, int N, int K,
+	const __half* A, int lda,
+	const __half* B, int ldb,
+	__half* C, int ldc,
+	float alpha_f, float beta_f
+) {
+	__half alpha = __float2half(alpha_f);
+	__half beta  = __float2half(beta_f);
+	auto& handle = tcnn_mublas_handle();
+	MUBLAS_CHECK_THROW(mublasSetStream(handle, stream));
+	MUBLAS_CHECK_THROW(mublasHgemm(
+		handle,
+		opB, opA,
+		N, M, K,
+		&alpha,
+		B, ldb,
+		A, lda,
+		&beta,
+		C, ldc
+	));
+}
+
+// float GEMM path
+static inline void _fc_mublas_gemm(
+	musaStream_t stream,
+	mublasOperation_t opA, mublasOperation_t opB,
+	int M, int N, int K,
+	const float* A, int lda,
+	const float* B, int ldb,
+	float* C, int ldc,
+	float alpha_f, float beta_f
+) {
+	auto& handle = tcnn_mublas_handle();
+	MUBLAS_CHECK_THROW(mublasSetStream(handle, stream));
+	MUBLAS_CHECK_THROW(mublasSgemm(
+		handle,
+		opB, opA,
+		N, M, K,
+		&alpha_f,
+		B, ldb,
+		A, lda,
+		&beta_f,
+		C, ldc
+	));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fc_multiply — preserves exact signatures from upstream cutlass_matmul.h so
+// cutlass_mlp.cu / fully_fused_mlp.cu compile unchanged.
+//
+//   D = activation_epilogue( A @ B + (sum_source ? C : 0) )
+//
+// - On CUDA/CUTLASS the epilogue is fused into the GEMM kernel.
+// - On MUSA we decompose: (1) mublas GEMM; (2) activation_gpu post-pass.
+//   Correctness-equivalent; some performance cost from the extra kernel.
+// ─────────────────────────────────────────────────────────────────────────────
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, MatrixLayout LayoutB, typename TypeC, MatrixLayout LayoutC, typename TypeD, MatrixLayout LayoutD>
 void fc_multiply(
 	musaStream_t stream,
-	const GPUMatrix<TypeA,
-	LayoutA>& A,
-	const GPUMatrix<TypeB,
-	LayoutB>& B,
-	const GPUMatrix<TypeC,
-	LayoutC>& C,
-	const GPUMatrix<TypeD,
-	LayoutD>& D,
+	const GPUMatrix<TypeA, LayoutA>& A,
+	const GPUMatrix<TypeB, LayoutB>& B,
+	const GPUMatrix<TypeC, LayoutC>& C,
+	const GPUMatrix<TypeD, LayoutD>& D,
 	Activation act = Activation::None,
 	bool transfer = false,
 	bool sum_source = false
 ) {
-	using CutlassLayoutA = typename std::conditional<LayoutA == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
-	using CutlassLayoutB = typename std::conditional<LayoutB == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
-	using CutlassLayoutC = typename std::conditional<LayoutC == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
-	using CutlassLayoutD = typename std::conditional<LayoutD == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
-
 	static_assert(std::is_same<TypeA, TypeB>::value, "Type of matrix A and B must be equal");
 	static_assert(std::is_same<TypeC, TypeD>::value, "Type of matrix C and D must be equal");
-	static_assert(std::is_same<CutlassLayoutC, CutlassLayoutD>::value, "Layout of matrix C and D must be equal");
-
-	using MatmulTypeCompute = std::conditional_t<std::is_same<TypeA, float>::value, float, cutlass::half_t>;
-	using MatmulTypeAccumulator = std::conditional_t<std::is_same<TypeC, float>::value, float, cutlass::half_t>;
+	static_assert(LayoutC == LayoutD, "Layout of matrix C and D must be equal");
 
 	if (A.n() != B.m()) {
 		throw std::runtime_error("Matrices A and B can not be multiplied together");
 	}
 
-	const int M = A.m();
-	const int K = A.n();
-	const int N = B.n();
+	const int M = (int)A.m();
+	const int K = (int)A.n();
+	const int N = (int)B.n();
 
-	if (C.m() != M || C.n() != N) {
+	if ((int)C.m() != M || (int)C.n() != N) {
 		throw std::runtime_error{fmt::format("Matrix C has incorrect size {}x{} != {}x{}", C.m(), C.n(), M, N)};
 	}
-
-	if (D.m() != M || D.n() != N) {
+	if ((int)D.m() != M || (int)D.n() != N) {
 		throw std::runtime_error{fmt::format("Matrix D has incorrect size {}x{} != {}x{}", D.m(), D.n(), M, N)};
 	}
 
+	mublasOperation_t opA = _mublas_op(A);
+	mublasOperation_t opB = _mublas_op(B);
+	int lda = _mublas_ld(A);
+	int ldb = _mublas_ld(B);
+	int ldd = _mublas_ld(D);
+
+	// If sum_source, pre-seed D with C (when distinct buffers); then issue
+	// GEMM with beta=1.0 to accumulate.
+	const float alpha = 1.0f;
+	const float beta  = sum_source ? 1.0f : 0.0f;
+
+	if (sum_source && (const void*)C.data() != (const void*)D.data()) {
+		CUDA_CHECK_THROW(musaMemcpyAsync(
+			(void*)D.data(),
+			(const void*)C.data(),
+			C.n_elements() * sizeof(TypeC),
+			musaMemcpyDeviceToDevice,
+			stream
+		));
+	}
+
+	_fc_mublas_gemm(
+		stream,
+		opA, opB,
+		M, N, K,
+		(const TypeA*)A.data(), lda,
+		(const TypeB*)B.data(), ldb,
+		(TypeD*)D.data(), ldd,
+		alpha, beta
+	);
+
+	// Post-GEMM activation. In tcnn's backward path with transfer=true, the
+	// activation-backward is fused into the epilogue on CUDA; on MUSA we
+	// invoke activation_backward_gpu here.
 	if (transfer) {
-		using Gemm = OurGemm<ActivationTransferOp<MatmulTypeAccumulator>, config, MatmulTypeCompute, CutlassLayoutA, MatmulTypeCompute, CutlassLayoutB, MatmulTypeAccumulator, CutlassLayoutC>;
-		typename Gemm::Arguments arguments{
-			{M, N, K},
-			{(MatmulTypeCompute*)A.data(), (int)A.stride()},
-			{(MatmulTypeCompute*)B.data(), (int)B.stride()},
-			{(MatmulTypeAccumulator*)C.data(), (int)C.stride()},
-			{(MatmulTypeAccumulator*)D.data(), (int)D.stride()},
-			{act},
-			1
-		};
-
-		fc_multiply_impl<Gemm>(stream, arguments);
-	} else {
-		using Gemm = OurGemm<ActivationOp<MatmulTypeAccumulator>, config, MatmulTypeCompute, CutlassLayoutA, MatmulTypeCompute, CutlassLayoutB, MatmulTypeAccumulator, CutlassLayoutC>;
-		typename Gemm::Arguments arguments{
-			{M, N, K},
-			{(MatmulTypeCompute*)A.data(), (int)A.stride()},
-			{(MatmulTypeCompute*)B.data(), (int)B.stride()},
-			{(MatmulTypeAccumulator*)C.data(), (int)C.stride()},
-			{(MatmulTypeAccumulator*)D.data(), (int)D.stride()},
-			{act, sum_source},
-			1
-		};
-
-		fc_multiply_impl<Gemm>(stream, arguments);
+		GPUMatrixDynamic<TypeC> C_view((TypeC*)C.data(), C.m(), C.n(), LayoutC, C.stride(), nullptr, nullptr);
+		GPUMatrixDynamic<TypeD> D_view((TypeD*)D.data(), D.m(), D.n(), LayoutD, D.stride(), nullptr, nullptr);
+		activation_backward_gpu(stream, act, C_view, D_view);
+	} else if (act != Activation::None) {
+		GPUMatrixDynamic<TypeD> D_view((TypeD*)D.data(), D.m(), D.n(), LayoutD, D.stride(), nullptr, nullptr);
+		activation_gpu(stream, act, D_view, D_view);
 	}
 }
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, MatrixLayout LayoutB, typename TypeC, typename TypeD>
 void fc_multiply(
 	musaStream_t stream,
-	const GPUMatrix<TypeA,
-	LayoutA>& A,
-	const GPUMatrix<TypeB,
-	LayoutB>& B,
+	const GPUMatrix<TypeA, LayoutA>& A,
+	const GPUMatrix<TypeB, LayoutB>& B,
 	const GPUMatrixDynamic<TypeC>& C,
 	const GPUMatrixDynamic<TypeD>& D,
 	Activation act = Activation::None,
@@ -436,7 +251,6 @@ void fc_multiply(
 	if (C.layout() != D.layout()) {
 		throw std::runtime_error{"fc_multiply: Layout of GPUMatrixDynamic C and D must be equal"};
 	}
-
 	if (D.layout() == CM) {
 		fc_multiply<config>(stream, A, B, C.cm(), D.cm(), act, transfer, sum_source);
 	} else {
@@ -447,8 +261,7 @@ void fc_multiply(
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, typename TypeC, typename TypeD>
 void fc_multiply(
 	musaStream_t stream,
-	const GPUMatrix<TypeA,
-	LayoutA>& A,
+	const GPUMatrix<TypeA, LayoutA>& A,
 	const GPUMatrixDynamic<TypeB>& B,
 	const GPUMatrixDynamic<TypeC>& C,
 	const GPUMatrixDynamic<TypeD>& D,
@@ -466,8 +279,7 @@ void fc_multiply(
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, typename TypeD>
 void fc_multiply(
 	musaStream_t stream,
-	const GPUMatrix<TypeA,
-	LayoutA>& A,
+	const GPUMatrix<TypeA, LayoutA>& A,
 	const GPUMatrixDynamic<TypeB>& B,
 	const GPUMatrixDynamic<TypeD>& D,
 	Activation act = Activation::None
@@ -475,78 +287,81 @@ void fc_multiply(
 	fc_multiply<config>(stream, A, B, D, D, act);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// fc_multiply_split_k — CUTLASS splits K across CTAs and reduces; muBLAS
+// internally parallelizes K for us, so we collapse split_k_slices into a
+// single mublas call, honoring the requested beta coefficient.
+// ─────────────────────────────────────────────────────────────────────────────
+
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, MatrixLayout LayoutB, typename TypeC, MatrixLayout LayoutC, typename TypeD, MatrixLayout LayoutD>
 void fc_multiply_split_k(
 	musaStream_t stream,
-	const GPUMatrix<TypeA,
-	LayoutA>& A,
-	const GPUMatrix<TypeB,
-	LayoutB>& B,
-	const GPUMatrix<TypeC,
-	LayoutC>& C,
-	const GPUMatrix<TypeD,
-	LayoutD>& D,
-	uint32_t split_k_slices = 1,
+	const GPUMatrix<TypeA, LayoutA>& A,
+	const GPUMatrix<TypeB, LayoutB>& B,
+	const GPUMatrix<TypeC, LayoutC>& C,
+	const GPUMatrix<TypeD, LayoutD>& D,
+	uint32_t /*split_k_slices*/ = 1,
 	float beta = 0.0f
 ) {
-	using CutlassLayoutA = typename std::conditional<LayoutA == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
-	using CutlassLayoutB = typename std::conditional<LayoutB == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
-	using CutlassLayoutC = typename std::conditional<LayoutC == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
-	using CutlassLayoutD = typename std::conditional<LayoutD == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
-
-	using MatmulTypeCompute = std::conditional_t<std::is_same<TypeA, float>::value, float, cutlass::half_t>;
-	using MatmulTypeAccumulator = std::conditional_t<std::is_same<TypeC, float>::value, float, cutlass::half_t>;
-
 	static_assert(std::is_same<TypeA, TypeB>::value, "Type of matrix A and B must be equal");
 	static_assert(std::is_same<TypeC, TypeD>::value, "Type of matrix C and D must be equal");
-	static_assert(std::is_same<CutlassLayoutC, CutlassLayoutD>::value, "Layout of matrix C and D must be equal");
+	static_assert(LayoutC == LayoutD, "Layout of matrix C and D must be equal");
 
 	if (A.n() != B.m()) {
 		throw std::runtime_error("Matrices A and B can not be multiplied together");
 	}
 
-	const int M = A.m();
-	const int K = A.n();
-	const int N = B.n();
+	const int M = (int)A.m();
+	const int K = (int)A.n();
+	const int N = (int)B.n();
 
-	if (C.m() != M || C.n() != N) {
+	if ((int)C.m() != M || (int)C.n() != N) {
 		throw std::runtime_error{fmt::format("Matrix C has incorrect size {}x{} != {}x{}", C.m(), C.n(), M, N)};
 	}
-
-	if (D.m() != M || D.n() != N) {
+	if ((int)D.m() != M || (int)D.n() != N) {
 		throw std::runtime_error{fmt::format("Matrix D has incorrect size {}x{} != {}x{}", D.m(), D.n(), M, N)};
 	}
 
-	using Gemm = SplitKGemm<SumOp<MatmulTypeAccumulator>, config, MatmulTypeCompute, CutlassLayoutA, MatmulTypeCompute, CutlassLayoutB, MatmulTypeAccumulator, CutlassLayoutC>;
-	typename Gemm::Arguments arguments{
-		{M, N, K},
-		{(MatmulTypeCompute*)A.data(), (int)A.stride()},
-		{(MatmulTypeCompute*)B.data(), (int)B.stride()},
-		{(MatmulTypeAccumulator*)C.data(), (int)C.stride()},
-		{(MatmulTypeAccumulator*)D.data(), (int)D.stride()},
-		{(TypeCompute)1.0f, (TypeCompute)beta},
-		(int)split_k_slices
-	};
+	mublasOperation_t opA = _mublas_op(A);
+	mublasOperation_t opB = _mublas_op(B);
+	int lda = _mublas_ld(A);
+	int ldb = _mublas_ld(B);
+	int ldd = _mublas_ld(D);
 
-	fc_multiply_split_k_impl<Gemm>(stream, arguments);
+	if (beta != 0.0f && (const void*)C.data() != (const void*)D.data()) {
+		CUDA_CHECK_THROW(musaMemcpyAsync(
+			(void*)D.data(),
+			(const void*)C.data(),
+			C.n_elements() * sizeof(TypeC),
+			musaMemcpyDeviceToDevice,
+			stream
+		));
+	}
+
+	_fc_mublas_gemm(
+		stream,
+		opA, opB,
+		M, N, K,
+		(const TypeA*)A.data(), lda,
+		(const TypeB*)B.data(), ldb,
+		(TypeD*)D.data(), ldd,
+		1.0f, beta
+	);
 }
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, MatrixLayout LayoutB, typename TypeC, typename TypeD>
 void fc_multiply_split_k(
 	musaStream_t stream,
-	const GPUMatrix<TypeA,
-	LayoutA>& A,
-	const GPUMatrix<TypeB,
-	LayoutB>& B,
+	const GPUMatrix<TypeA, LayoutA>& A,
+	const GPUMatrix<TypeB, LayoutB>& B,
 	const GPUMatrixDynamic<TypeC>& C,
 	const GPUMatrixDynamic<TypeD>& D,
 	uint32_t split_k_slices = 1,
 	float beta = 0.0f
 ) {
 	if (C.layout() != D.layout()) {
-		throw std::runtime_error{"fc_multiply: Layout of GPUMatrixDynamic C and D must be equal"};
+		throw std::runtime_error{"fc_multiply_split_k: Layout of GPUMatrixDynamic C and D must be equal"};
 	}
-
 	if (D.layout() == CM) {
 		fc_multiply_split_k<config>(stream, A, B, C.cm(), D.cm(), split_k_slices, beta);
 	} else {
@@ -557,9 +372,8 @@ void fc_multiply_split_k(
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, typename TypeC, typename TypeD>
 void fc_multiply_split_k(
 	musaStream_t stream,
-	const GPUMatrix<TypeA,
-	LayoutA>& A,
-	const GPUMatrixDynamic<TypeB>& B,
+	const GPUMatrix<TypeA, LayoutA>& A,
+	const GPUMatrix<TypeB, LayoutB>& B,
 	const GPUMatrixDynamic<TypeC>& C,
 	const GPUMatrixDynamic<TypeD>& D,
 	uint32_t split_k_slices = 1,
@@ -601,4 +415,27 @@ void fc_multiply_split_k(
 	fc_multiply_split_k<config>(stream, A, B, D, D, split_k_slices, beta);
 }
 
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Tag types for tcnn's FullLayer / LastLayer / FullLayerK / LastLayerK
+// aliases. tcnn's cutlass_mlp.h templates fc_multiply<FullLayer>(...) etc.,
+// but those template params are opaque — tcnn never peeks inside them after
+// this point, so empty tag types are sufficient.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <typename Shape1, typename Shape2>
+struct LayerConfig { using k_thread_block = Shape1; using k_warp = Shape2; };
+
+template <int M, int N, int K>
+struct GemmShape_ {
+	static constexpr int kM = M;
+	static constexpr int kN = N;
+	static constexpr int kK = K;
+};
+
+using _tcnn_dummy_shape = GemmShape_<128, 128, 32>;
+using FullLayer   = LayerConfig<_tcnn_dummy_shape, _tcnn_dummy_shape>;
+using LastLayer   = LayerConfig<_tcnn_dummy_shape, _tcnn_dummy_shape>;
+using FullLayerK  = LayerConfig<_tcnn_dummy_shape, _tcnn_dummy_shape>;
+using LastLayerK  = LayerConfig<_tcnn_dummy_shape, _tcnn_dummy_shape>;
+
+} // namespace tcnn

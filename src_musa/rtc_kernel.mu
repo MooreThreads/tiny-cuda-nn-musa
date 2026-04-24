@@ -1,31 +1,27 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * BSD 3-clause — see original rtc_kernel.cu header.
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * MUSA port (auto-musify round 2):
+ *   Runtime-compilation helper. Upstream uses NVRTC + CUDA driver module-load
+ *   with PTX as the intermediate form. On MUSA:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-/** @file   rtc_kernel.h
- *  @author Thomas Müller, NVIDIA
- *  @brief  Helper class for compiling CUDA kernels at run time using
- *          the NVRTC API.
+ *     NVRTC → MTRTC (mtrtc*) — same API shape (prog/compile/log/lowered name)
+ *     PTX → fatbin — mtrtcGetPTX* is absent; mtrtcGetFatBin{,Size} is the
+ *                    authoritative output. The MUSA driver accepts the fatbin
+ *                    via muModuleLoadFatBinary.
+ *     --gpu-architecture=compute_<cc>  →  --gpu-architecture=mp_<ARCH>
+ *          (S5000 = mp_21; queried at runtime from musa device property rather
+ *           than hardcoded so the same object file works on S4000 / future HW).
+ *
+ *   Rule-3 parallel-folder porting: original rtc_kernel.cu (CUDA/NVRTC)
+ *   remains untouched under src/; this file under src_musa/ is the MUSA
+ *   replacement.
+ *
+ *   Rule-4 API mappings: every mtrtc* name used below was looked up in
+ *   /usr/local/musa/include/mtrtc.h (SDK 5.1.0 ships nvrtc-shaped API with the
+ *   mtrtc prefix). Fatbin-not-PTX behavior is documented there as well
+ *   (mtrtcGetPTX* commented out; mtrtcGetFatBin is the live entry point).
  */
 
 #include <tiny-cuda-nn/common_host.h>
@@ -37,6 +33,7 @@ CMRC_DECLARE(tcnn);
 #endif
 
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -76,23 +73,58 @@ void CudaRtcKernel::clear() {}
 
 }
 #else
-#include <nvrtc.h>
+#include <mtrtc.h>
+#include <musa.h>
+#include <musa_runtime.h>
 
-/// Checks the result of a cudaXXXXXX call and throws an error on failure
-#define NVRTC_CHECK_THROW(x)                                                                                             \
-	do {                                                                                                                 \
-		nvrtcResult _result = x;                                                                                          \
-		if (_result != NVRTC_SUCCESS)                                                                                     \
-			throw std::runtime_error{std::string(FILE_LINE " " #x " failed with error ") + nvrtcGetErrorString(_result)}; \
-	} while(0)
+/// Checks the result of an mtrtc* call and throws on failure.
+#define MTRTC_CHECK_THROW(x)                                                                                              \
+	do {                                                                                                                    \
+		mtrtcResult _result = (x);                                                                                            \
+		if (_result != MTRTC_SUCCESS)                                                                                         \
+			throw std::runtime_error{std::string(FILE_LINE " " #x " failed with error ") + mtrtcGetErrorString(_result)};    \
+	} while (0)
 
 namespace tcnn {
 
+// Pick an mtrtc --gpu-architecture tag. mtrtc accepts {mp_10, mp_21, mp_22,
+// mp_31}. Map the MUSA device's (major, minor) compute capability to the
+// nearest supported mp tag. S5000 = (2,1); S4000 = (2,2); future PH2 = (3,1).
+static std::string musa_mtrtc_arch_for_device(int device) {
+	musaDeviceProp prop{};
+	if (musaGetDeviceProperties(&prop, device) != musaSuccess) {
+		// Fall back to mp_21 (S5000 / PH1 — the round-2 target).
+		return "mp_21";
+	}
+	int code = prop.major * 10 + prop.minor;
+	switch (code) {
+		case 10: return "mp_10";
+		case 21: return "mp_21";
+		case 22: return "mp_22";
+		case 31: return "mp_31";
+		default:
+			// Unknown arch: pick the newest mtrtc-supported tag. mtrtc's runtime
+			// is forward-tolerant — if the HW is newer than mp_31, producing
+			// mp_31 fatbin still loads (PH2 extends PH1's ISA).
+			return "mp_31";
+	}
+}
+
 bool supports_jit_fusion(int device) {
-	// Technically, RTC is supported on earlier architectures and CUDA versions
-	// as well, but the way we fuse MLPs doesn't work on those. So only permit
-	// JIT operation on Turing and higher.
-	return TCNN_HALF_PRECISION && cuda_supported_compute_capability(device) >= 75 && cuda_runtime_version() >= 11080;
+	// On MUSA the CUDA-era "Turing+" gate (compute >= 75) doesn't translate
+	// directly. We require TCNN_HALF_PRECISION (kernel fusion relies on
+	// __half), and confirm the device exists + has a supported arch tag.
+	if (!TCNN_HALF_PRECISION) {
+		return false;
+	}
+	musaDeviceProp prop{};
+	if (musaGetDeviceProperties(&prop, device) != musaSuccess) {
+		return false;
+	}
+	// S4000 (mp_22) and S5000 (mp_21) both support fused MLP JIT. Keep this
+	// conservative and allow anything mtrtc recognizes.
+	auto arch = musa_mtrtc_arch_for_device(device);
+	return arch != "mp_10";  // mp_10 is legacy / not a real shipping SKU
 }
 
 #ifdef TCNN_CMRC
@@ -112,11 +144,12 @@ std::vector<std::pair<std::string, const char*>> all_files(const cmrc::embedded_
 }
 #endif
 
-// If a cache dir is provided, compilation artifacts will be cached in there and re-loaded upon program restart. Improves the user experience.
+// If a cache dir is provided, compilation artifacts are cached in there and
+// re-loaded upon program restart. Improves user experience.
 CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_code, const std::vector<std::pair<std::string, const char*>>& extra_includes) {
 	if (!supports_jit_fusion()) {
 		throw std::runtime_error{fmt::format(
-			"JIT: unsupported. Must use CUDA 11.8 and a GPU with compute capability 75 or higher, but got CUDA {} and compute capability {}.", cuda_runtime_version(), cuda_compute_capability()
+			"JIT: unsupported on this MUSA device. Requires TCNN_HALF_PRECISION and a device mtrtc recognizes (mp_21/mp_22/mp_31)."
 		)};
 	}
 
@@ -124,16 +157,15 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 
 	const auto start_time = std::chrono::steady_clock::now();
 
-	uint32_t cc = cuda_supported_compute_capability();
-
-	// Strangely, compute capabilities above 90 compile to slower MLP code, even on Blackwell GPUs.
-	// For now, until we figure out how to fix this, we therefore cap the compute capability at 90.
-	cc = min(cc, 90u);
+	std::string arch_tag = musa_mtrtc_arch_for_device(cuda_device());
 
 	std::vector<std::string> opts = {
-		fmt::format("--gpu-architecture=compute_{}", cc),
+		fmt::format("--gpu-architecture={}", arch_tag),
 		fmt::format("-DTCNN_HALF_PRECISION={}", TCNN_HALF_PRECISION),
-		fmt::format("-DTCNN_MIN_GPU_ARCH={}", cc),
+		// TCNN_MIN_GPU_ARCH is a tcnn host-side knob (int) gating which kernel
+		// variants compile. On MUSA we pass the mp_xx arch's minor*10+major
+		// numeric form: mp_21 = 21 (S5000).
+		fmt::format("-DTCNN_MIN_GPU_ARCH={}", TCNN_MIN_GPU_ARCH),
 		"--std=c++14",
 #ifdef TCNN_RTC_USE_FAST_MATH
 		"--use_fast_math",
@@ -170,7 +202,7 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 			 */
 
-			/** @file   {KERNEL_NAME}.cu
+			/** @file   {KERNEL_NAME}.mu
 			 *  @author Thomas Müller, NVIDIA
 			 *  @brief  Automatically generated kernel {KERNEL_NAME}
 			 */
@@ -179,10 +211,10 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 			{OPTS}
 			*/
 
-			// NVRTC does not come with the C++ standard library out of the box and
-			// it would be troublesome to bundle it or require users to have it installed
-			// in readily available paths. So we instead include a minimal custom
-			// implementation of just those function of std:: that we require.
+			// MTRTC does not come with the C++ standard library out of the box and
+			// it would be troublesome to bundle it or require users to have it
+			// installed in readily available paths. So we instead include a minimal
+			// custom implementation of just those functions of std:: that we require.
 			#include <tiny-cuda-nn/ministd.h>
 			{PREAMBLE}
 
@@ -197,16 +229,14 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 	size_t code_hash = hash_combine(0, complete_code);
 
 	std::vector<const char*> headers = {
-		// First define headers that we wish to ignore (because they won't be available
-		// at runtime). Instead, we will include tiny-cuda-nn/ministd.h, which implements
-		// the small subset of the STL that we actually need.
+		// Define header names that we wish mtrtc to treat as empty (they won't
+		// be available at runtime); ministd.h above provides the subset of the
+		// STL that we actually use.
 		"algorithm", "cassert", "cmath", "cstddef", "cstdint", "cstdio", "musa.h", "limits", "type_traits", "initializer_list",
 	};
 	std::vector<const char*> headers_content(headers.size(), "");
 
-	// Next, we add all headers that come bundled with tcnn as well as those we received in the constructor.
-	// We combine each header's hash with that of our code to obtain a unique fingerprint that can be used
-	// for caching.
+	// Add all headers bundled with tcnn and anything the caller supplied.
 	std::vector<std::pair<std::string, const char*>> includes;
 #if TCNN_CMRC
 	includes = all_files(cmrc::tcnn::get_filesystem());
@@ -219,96 +249,115 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 	}
 
 	std::string code_hash_string = fmt::format("{:016x}", code_hash);
-	std::string filename = fmt::format("{}.{}.cu", name, code_hash_string);
+	std::string filename = fmt::format("{}.{}.mu", name, code_hash_string);
 
 	std::string cache_dir = rtc_cache_dir();
 	bool use_cache = !cache_dir.empty();
 
 	std::string cached_code_filename = fmt::format("{}/{}", cache_dir, filename);
-	std::string cached_ptx_filename = fmt::format("{}/{}.{}.ptx", cache_dir, name, code_hash_string);
+	// Cache the fatbin (not PTX) — mtrtc emits fatbin only. Extension kept
+	// deliberately-different from the CUDA/.ptx form to avoid cross-pollution
+	// when a repo is re-built on alternating toolchains.
+	std::string cached_fatbin_filename = fmt::format("{}/{}.{}.fatbin", cache_dir, name, code_hash_string);
 
-	std::vector<char> ptx;
+	std::vector<char> fatbin;
 	std::string lowered_kernel_name;
 
 	if (use_cache) {
 		{
 			std::ifstream f{cached_code_filename};
 			if (!f) {
-				// Dump source code to disk for easier debugging & caching.
+				// Dump source code to disk for easier debugging + caching.
 				std::ofstream of{cached_code_filename};
 				of << complete_code;
 			}
 		}
 
-		// Check if we've cached the resulting PTX last time around and load it if so.
-		std::ifstream f{cached_ptx_filename};
+		// Check if we cached the resulting fatbin last time around and load it.
+		std::ifstream f{cached_fatbin_filename, std::ios::binary};
 		if (f) {
-			// The first line of the cached PTX contains a comment of the form
-			//  `//lowered_kernel_name=<value>` which we need to parse.
+			// The first line of the cached fatbin contains a comment of the form
+			//   `//lowered_kernel_name=<value>\n` which we need to parse. This
+			// is a tcnn sidecar convention preserved from the CUDA path — the
+			// name prefix is stripped off before feeding to muModuleLoadFatBinary.
 			std::string first_line;
-			f >> first_line;
+			std::getline(f, first_line);
 			auto s = split(first_line, "=");
 			if (s.size() == 2 && s[0].find("lowered_kernel_name") != std::string::npos) {
 				lowered_kernel_name = s[1];
 				f.seekg(0, std::ios::end);
 				size_t size = f.tellg();
-				ptx.resize(size, '\0');
+				fatbin.resize(size, '\0');
 				f.seekg(0);
-				f.read(ptx.data(), size);
+				f.read(fatbin.data(), size);
 			}
 		}
 	}
 
-	// If we haven't loaded PTX from cache, compile the program
-	bool cached_ptx = !ptx.empty();
-	if (!cached_ptx) {
-		nvrtcProgram prog;
-		NVRTC_CHECK_THROW(nvrtcCreateProgram(&prog, complete_code.c_str(), filename.c_str(), headers.size(), headers_content.data(), headers.data()));
+	// If we haven't loaded fatbin from cache, compile the program.
+	bool cached_fatbin = !fatbin.empty();
+	if (!cached_fatbin) {
+		mtrtcProgram prog;
+		MTRTC_CHECK_THROW(mtrtcCreateProgram(&prog, complete_code.c_str(), filename.c_str(), (int)headers.size(), headers_content.data(), headers.data()));
 
-		NVRTC_CHECK_THROW(nvrtcAddNameExpression(prog, name.c_str()));
+		MTRTC_CHECK_THROW(mtrtcAddNameExpression(prog, name.c_str()));
 
 		std::vector<const char*> opts_c_str;
 		for (const auto& opt : opts) {
 			opts_c_str.emplace_back(opt.c_str());
 		}
 
-		nvrtcResult compile_result = nvrtcCompileProgram(prog, opts_c_str.size(), opts_c_str.data());
-		if (compile_result != NVRTC_SUCCESS) {
+		mtrtcResult compile_result = mtrtcCompileProgram(prog, (int)opts_c_str.size(), opts_c_str.data());
+		if (compile_result != MTRTC_SUCCESS) {
 			size_t log_size;
-			NVRTC_CHECK_THROW(nvrtcGetProgramLogSize(prog, &log_size));
-			std::vector<char> log(log_size+1, '\0');
-			NVRTC_CHECK_THROW(nvrtcGetProgramLog(prog, log.data()));
+			MTRTC_CHECK_THROW(mtrtcGetProgramLogSize(prog, &log_size));
+			std::vector<char> log(log_size + 1, '\0');
+			MTRTC_CHECK_THROW(mtrtcGetProgramLog(prog, log.data()));
 			throw std::runtime_error{fmt::format("JIT: compiling {} failed:\n{}", filename, log.data())};
 		}
 
 		const char* lowered_kernel_name_cstr;
-		NVRTC_CHECK_THROW(nvrtcGetLoweredName(prog, name.c_str(), &lowered_kernel_name_cstr));
+		MTRTC_CHECK_THROW(mtrtcGetLoweredName(prog, name.c_str(), &lowered_kernel_name_cstr));
 		lowered_kernel_name = lowered_kernel_name_cstr;
 
-		size_t ptx_size;
-		NVRTC_CHECK_THROW(nvrtcGetPTXSize(prog, &ptx_size));
-		ptx.resize(ptx_size, '\0');
-		NVRTC_CHECK_THROW(nvrtcGetPTX(prog, ptx.data()));
+		size_t fatbin_size;
+		MTRTC_CHECK_THROW(mtrtcGetFatBinSize(prog, &fatbin_size));
+		fatbin.resize(fatbin_size, '\0');
+		MTRTC_CHECK_THROW(mtrtcGetFatBin(prog, fatbin.data()));
 
 		std::string lowered_kernel_name_comment = fmt::format("//lowered_kernel_name={}\n", lowered_kernel_name);
-		ptx.insert(std::begin(ptx), std::begin(lowered_kernel_name_comment), std::end(lowered_kernel_name_comment));
+		fatbin.insert(std::begin(fatbin), std::begin(lowered_kernel_name_comment), std::end(lowered_kernel_name_comment));
 
-		NVRTC_CHECK_THROW(nvrtcDestroyProgram(&prog));
+		MTRTC_CHECK_THROW(mtrtcDestroyProgram(&prog));
 
 		if (use_cache) {
-			std::ofstream f{cached_ptx_filename};
+			std::ofstream f{cached_fatbin_filename, std::ios::binary};
 			if (f) {
-				f.write(ptx.data(), ptx.size());
+				f.write(fatbin.data(), fatbin.size());
 			}
 		}
 	}
 
-	CU_CHECK_THROW(muModuleLoadDataEx(&m_module, ptx.data(), 0, nullptr, nullptr));
+	// Strip the `//lowered_kernel_name=<value>\n` prefix before feeding to the
+	// MUSA driver — muModuleLoadFatBinary wants a pure fatbin image.
+	const char* fatbin_begin = fatbin.data();
+	size_t fatbin_len = fatbin.size();
+	{
+		// Find the first newline; everything after it is the actual fatbin.
+		const char* nl = static_cast<const char*>(std::memchr(fatbin_begin, '\n', fatbin_len));
+		if (nl && std::string(fatbin_begin, nl - fatbin_begin).find("lowered_kernel_name=") != std::string::npos) {
+			size_t consumed = (size_t)(nl - fatbin_begin) + 1;
+			fatbin_begin += consumed;
+			fatbin_len   -= consumed;
+		}
+	}
+
+	CU_CHECK_THROW(muModuleLoadFatBinary(&m_module, fatbin_begin));
 	CU_CHECK_THROW(muModuleGetFunction(&m_kernel, m_module, lowered_kernel_name.c_str()));
 
 	float compilation_duration_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - start_time).count();
-	if (!cached_ptx || compilation_duration_seconds > 0.1f) { // Don't spam the user if the kernel is loaded from cache very fast.
-		log_success("JIT: compiled {} in {:.02f}s (cached_ptx={})", filename, compilation_duration_seconds, cached_ptx);
+	if (!cached_fatbin || compilation_duration_seconds > 0.1f) { // Don't spam if load-from-cache was fast.
+		log_success("JIT: compiled {} in {:.02f}s (cached_fatbin={})", filename, compilation_duration_seconds, cached_fatbin);
 	}
 
 	cleanup_guard.disarm();
@@ -320,7 +369,7 @@ CudaRtcKernel::~CudaRtcKernel() {
 
 void CudaRtcKernel::clear() {
 	if (m_module) {
-		cuModuleUnload(m_module);
+		muModuleUnload(m_module);
 		m_module = {};
 	}
 }
