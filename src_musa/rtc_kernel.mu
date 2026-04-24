@@ -168,11 +168,20 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 	// long-form `--include-path=<dir>` spelling documented in the same
 	// header to stay on the conservative side of the same parser.
 	//
-	// Macros baked below are injected via the {PREAMBLE} slot of
-	// complete_code; the options vector below carries only arch/std/misc.
+	// Macros baked below are injected via the {RTC_DEFINES} slot of
+	// complete_code; the options vector below carries only arch/misc.
+	//
+	// Round 4: mtrtc additionally rejects every documented `--std=` /
+	// `-std=` / `--std <val>` form for both c++14 and c++17 (verifier bug
+	// instant-ngp-005). Empirically confirmed via a standalone mtrtc probe
+	// (5 variants tried, all INVALID_OPTION; only the no-flag variant
+	// succeeded). Dropping the flag entirely is the only working path on
+	// SDK 5.1.0; mtrtc's built-in default is ≥ C++17 and correctly compiles
+	// tcnn's generated code without an explicit --std. If a future SDK
+	// accepts any spelling, the flag can be reintroduced in that spelling.
 	std::vector<std::string> opts = {
 		fmt::format("--gpu-architecture={}", arch_tag),
-		"--std=c++14",
+		// --std=c++14 intentionally omitted — see Round 4 comment above.
 #ifdef TCNN_RTC_USE_FAST_MATH
 		"--use_fast_math",
 #endif

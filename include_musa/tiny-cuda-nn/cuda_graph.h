@@ -63,95 +63,34 @@ public:
 	}
 
 	ScopeGuard capture_guard(musaStream_t stream) {
-		// Can't capture on the global stream
-		if (stream == nullptr || stream == musaStreamLegacy) {
-			return {};
-		}
-
-		// If the caller is already capturing, no need for a nested capture.
-		musaStreamCaptureStatus capture_status;
-		CUDA_CHECK_THROW(musaStreamIsCapturing(stream, &capture_status));
-		if (capture_status != musaStreamCaptureStatusNone) {
-			return {};
-		}
-
-		musaError_t capture_result = musaStreamIsCapturing(musaStreamLegacy, &capture_status);
-		if (capture_result == musaErrorStreamCaptureImplicit) {
-			return {};
-		}
-
-		CUDA_CHECK_THROW(capture_result);
-		if (capture_status != musaStreamCaptureStatusNone) {
-			return {};
-		}
-
-		// Start capturing
-		if (m_graph) {
-			CUDA_CHECK_THROW(musaGraphDestroy(m_graph));
-			m_graph = nullptr;
-		}
-
-		CUDA_CHECK_THROW(musaStreamBeginCapture(stream, musaStreamCaptureModeRelaxed));
-		current_captures().push_back(this);
-
-		// Stop capturing again once the returned object goes out of scope
-		return ScopeGuard{[this, stream]() {
-			CUDA_CHECK_THROW(musaStreamEndCapture(stream, &m_graph));
-
-			if (current_captures().back() != this) {
-				throw std::runtime_error{"CudaGraph: must end captures in reverse order of creation."};
-			}
-			current_captures().pop_back();
-
-			if (m_synchronize_when_capture_done) {
-				CUDA_CHECK_THROW(musaDeviceSynchronize());
-				m_synchronize_when_capture_done = false;
-			}
-
-			// Capture failed for some reason. Reset state and don't execute anything.
-			// A corresponding exception is likely already in flight.
-			if (!m_graph) {
-				if (m_graph_instance) {
-					CUDA_CHECK_THROW(musaGraphExecDestroy(m_graph_instance));
-				}
-
-				m_graph = nullptr;
-				m_graph_instance = nullptr;
-				return;
-			}
-
-			// If we previously created a graph instance, try to update it with the newly captured graph.
-			// This is cheaper than creating a new instance from scratch (and may involve just updating
-			// pointers rather than changing the topology of the graph.)
-			if (m_graph_instance) {
-#if CUDA_VERSION >= 12000
-				musaGraphExecUpdateResultInfo update_result;
-				CUDA_CHECK_THROW(musaGraphExecUpdate(m_graph_instance, m_graph, &update_result));
-
-				// If the update failed, reset graph instance. We will create a new one next.
-				if (update_result.result != musaGraphExecUpdateSuccess) {
-					CUDA_CHECK_THROW(musaGraphExecDestroy(m_graph_instance));
-					m_graph_instance = nullptr;
-				}
-#else
-				musaGraphExecUpdateResult update_result;
-				musaGraphNode_t error_node;
-				CUDA_CHECK_THROW(musaGraphExecUpdate(m_graph_instance, m_graph, &error_node, &update_result));
-
-				// If the update failed, reset graph instance. We will create a new one next.
-				if (update_result != musaGraphExecUpdateSuccess) {
-					CUDA_CHECK_THROW(musaGraphExecDestroy(m_graph_instance));
-					m_graph_instance = nullptr;
-				}
-#endif
-			}
-
-			if (!m_graph_instance) {
-				CUDA_CHECK_THROW(musaGraphInstantiate(&m_graph_instance, m_graph, NULL, NULL, 0));
-			}
-
-			CUDA_CHECK_THROW(musaGraphLaunch(m_graph_instance, stream));
-		}};
+		// Round 4: CUDA graph capture / replay is broken on MUSA SDK 5.1.0 +
+		// S5000 (mp_21). `musaStreamBeginCapture(stream, ...)` succeeds at the
+		// musart API level but leaves the stream in a capture state that
+		// subsequently poisons `musaDeviceSynchronize` with "operation not
+		// permitted when stream is capturing", which cascades into
+		// `musaEventRecord` at multi_stream.h:83 failing with "operation
+		// failed due to a previous error during capture" — verifier round-3
+		// reproduced this on all 4 training scenes (NeRF/SDF×2/Image). The
+		// prior-run prescription in CODE_ANALYSIS §6 gotcha #2 (curated from
+		// the 2026-03 auto-musify fleet on SDK 4.3.5 where the same class of
+		// issue was already ratified) is to stub this function to return an
+		// empty ScopeGuard — skip musaStreamBeginCapture entirely, skip the
+		// teardown, rely on individual kernel launches without graph
+		// batching.
+		//
+		// Correctness: preserved. Every kernel the graph would have captured
+		// still runs via its normal launch path. Performance: tcnn loses the
+		// kernel-launch-overhead amortization graph capture provides, so
+		// training iterations are slower than on the CUDA baseline, but the
+		// result is numerically identical. Retained as a MUSA-only Known
+		// Limitation; if a future SDK fixes musaStreamBeginCapture, this stub
+		// can be removed and the CUDA-path body below restored.
+		//
+		// m_graph / m_graph_instance remain nullptr forever under this stub,
+		// so reset() / the destructor are already safe (both have `if (m_X)`
+		// guards around their free paths).
+		(void)stream;
+		return ScopeGuard{};
 	}
 
 	void reset() {
