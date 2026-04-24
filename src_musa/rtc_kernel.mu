@@ -179,13 +179,30 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 	// SDK 5.1.0; mtrtc's built-in default is ≥ C++17 and correctly compiles
 	// tcnn's generated code without an explicit --std. If a future SDK
 	// accepts any spelling, the flag can be reintroduced in that spelling.
+	//
+	// Round 5: comprehensive options probe run in-container (fork-isolated
+	// to survive mtrtc's allocator-corrupting-on-INVALID_OPTION behavior)
+	// enumerated every tcnn/NVRTC-era option. Authoritative accept/reject
+	// set for mtrtc 14.0 / SDK 5.1.0 recorded in MUSIFY.md § Knowledge Base
+	// [Round 5]. Summary: `--gpu-architecture=`, `--use_fast_math`,
+	// `--include-path=`, `--disable-warnings`/`-w`, `--ftz=` are accepted;
+	// `--extra-device-vectorization`, `-I<dir>` (short form), every
+	// `--prec-*`/`--fmad=`, `--maxrregcount=`, `--ptxas-options`/`-Xptxas`,
+	// `--std=*`, `-D*`, and surprisingly the header-documented
+	// `--define-macro=` are all rejected.
+	//
+	// Applied drops: `--extra-device-vectorization` (was line 188). Kept:
+	// `--use_fast_math` (gated, PASS), `--include-path=<dir>` (PASS, long
+	// form used — short form `-I<dir>` rejected).
 	std::vector<std::string> opts = {
 		fmt::format("--gpu-architecture={}", arch_tag),
 		// --std=c++14 intentionally omitted — see Round 4 comment above.
 #ifdef TCNN_RTC_USE_FAST_MATH
 		"--use_fast_math",
 #endif
-		"--extra-device-vectorization",
+		// --extra-device-vectorization intentionally omitted — see Round 5
+		// comment above. Dropped per verifier bug instant-ngp-006; probe
+		// confirmed no mtrtc-accepted spelling exists for this NVRTC flag.
 	};
 
 	if (!rtc_include_dir().empty()) {
