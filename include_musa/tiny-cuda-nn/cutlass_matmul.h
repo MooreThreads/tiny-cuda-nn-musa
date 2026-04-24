@@ -373,7 +373,7 @@ template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB,
 void fc_multiply_split_k(
 	musaStream_t stream,
 	const GPUMatrix<TypeA, LayoutA>& A,
-	const GPUMatrix<TypeB, LayoutB>& B,
+	const GPUMatrixDynamic<TypeB>& B,
 	const GPUMatrixDynamic<TypeC>& C,
 	const GPUMatrixDynamic<TypeD>& D,
 	uint32_t split_k_slices = 1,
