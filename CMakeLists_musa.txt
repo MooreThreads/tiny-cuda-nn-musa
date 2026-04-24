@@ -80,6 +80,10 @@ musa_add_library(tiny-cuda-nn STATIC ${TCNN_SOURCES})
 target_compile_definitions(tiny-cuda-nn PUBLIC ${TCNN_DEFINITIONS})
 target_include_directories(tiny-cuda-nn PUBLIC ${TCNN_INCLUDES})
 # Round 2: link mublas (CUTLASS shim backend) + mtrtc (JIT) + musart/musa driver.
+# FindMUSA does not auto-propagate `-L/usr/local/musa/lib` to downstream targets;
+# an explicit target_link_directories is required or ld rejects the bare library
+# names ("cannot find -lmublas").
+target_link_directories(tiny-cuda-nn PUBLIC /usr/local/musa/lib)
 target_link_libraries(tiny-cuda-nn
     fmt
     tiny-cuda-nn-resources
