@@ -159,13 +159,19 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 
 	std::string arch_tag = musa_mtrtc_arch_for_device(cuda_device());
 
+	// Round 3: mtrtc 14.0 rejects the short-form `-DNAME=VALUE` spelling (per
+	// verifier bug instant-ngp-003; verified empirically at runtime even
+	// though /usr/local/musa/include/mtrtc.h docs `-D` as a short form). The
+	// robust fix is to bake the defines directly into the generated source
+	// preamble as literal `#define` directives — that avoids depending on
+	// mtrtc's argv parser behavior entirely. For include-path, use the
+	// long-form `--include-path=<dir>` spelling documented in the same
+	// header to stay on the conservative side of the same parser.
+	//
+	// Macros baked below are injected via the {PREAMBLE} slot of
+	// complete_code; the options vector below carries only arch/std/misc.
 	std::vector<std::string> opts = {
 		fmt::format("--gpu-architecture={}", arch_tag),
-		fmt::format("-DTCNN_HALF_PRECISION={}", TCNN_HALF_PRECISION),
-		// TCNN_MIN_GPU_ARCH is a tcnn host-side knob (int) gating which kernel
-		// variants compile. On MUSA we pass the mp_xx arch's minor*10+major
-		// numeric form: mp_21 = 21 (S5000).
-		fmt::format("-DTCNN_MIN_GPU_ARCH={}", TCNN_MIN_GPU_ARCH),
 		"--std=c++14",
 #ifdef TCNN_RTC_USE_FAST_MATH
 		"--use_fast_math",
@@ -174,8 +180,19 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 	};
 
 	if (!rtc_include_dir().empty()) {
-		opts.emplace_back(fmt::format("-I{}", rtc_include_dir()));
+		opts.emplace_back(fmt::format("--include-path={}", rtc_include_dir()));
 	}
+
+	// Round 3: defines moved from the options vector into the source preamble
+	// as literal #define lines (see long comment on options construction
+	// above). Join so they sit before generate_device_code_preamble()'s
+	// contents — tcnn's kernel templates expect TCNN_HALF_PRECISION and
+	// TCNN_MIN_GPU_ARCH to be visible before any tcnn header is included.
+	std::string rtc_defines = fmt::format(
+		"#define TCNN_HALF_PRECISION {}\n"
+		"#define TCNN_MIN_GPU_ARCH {}\n",
+		TCNN_HALF_PRECISION, TCNN_MIN_GPU_ARCH
+	);
 
 	std::string complete_code = dfmt(0, R"(
 			/*
@@ -211,6 +228,10 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 			{OPTS}
 			*/
 
+			// Round 3: defines injected here instead of via options vector —
+			// mtrtc 14.0 rejected `-DNAME=VALUE` at runtime.
+			{RTC_DEFINES}
+
 			// MTRTC does not come with the C++ standard library out of the box and
 			// it would be troublesome to bundle it or require users to have it
 			// installed in readily available paths. So we instead include a minimal
@@ -221,6 +242,7 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
 			{KERNEL_CODE}
 		)",
 		"KERNEL_NAME"_a = name,
+		"RTC_DEFINES"_a = rtc_defines,
 		"PREAMBLE"_a = generate_device_code_preamble(),
 		"OPTS"_a = join(opts, "\n"),
 		"KERNEL_CODE"_a = kernel_code

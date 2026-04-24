@@ -94,7 +94,19 @@ inline mublasHandle_t& tcnn_mublas_handle() {
 
 template <typename T, MatrixLayout Layout>
 static inline mublasOperation_t _mublas_op(const GPUMatrix<T, Layout>& /*M*/) {
-	return Layout == RM ? MUBLAS_OP_T : MUBLAS_OP_N;
+	// Row-major (m x n, stride=n) viewed column-major (ld=n) == A^T, dims
+	// (n x m). To compute row-major C = A @ B via column-major we issue
+	//   Z_cm = B_cm @ A_cm = B^T @ A^T = (AB)^T = C_cm  (which sits in the
+	// same memory as row-major C), with no mublas-op on either side —
+	// the column-major "view" already contains the transpose. So for
+	// row-major inputs the mublas op is *N* (not T). For column-major
+	// inputs the column-major view IS the matrix itself (no implicit
+	// transpose), so we need op=T to flip it into the C_cm = B^T @ A^T
+	// target form. Round-2 had this flipped, causing mublasHgemm to see
+	// inconsistent (rows_pre_op vs ld) pairs and reject with
+	// MUBLAS_STATUS_INVALID_VALUE on the first non-stub call (bug
+	// instant-ngp-002).
+	return Layout == RM ? MUBLAS_OP_N : MUBLAS_OP_T;
 }
 
 template <typename T, MatrixLayout Layout>
@@ -102,7 +114,88 @@ static inline int _mublas_ld(const GPUMatrix<T, Layout>& M) {
 	return (int)M.stride();
 }
 
-// half-precision GEMM path (used when network_precision_t == __half)
+// ─────────────────────────────────────────────────────────────────────────────
+// Round-3 F16 → F32 upcast helpers (wiki bugfix-library-deps Fix #2, verified
+// in MNN). mublasHgemm rejects tcnn's shapes at runtime on S5000/SDK 5.1.0
+// with MUBLAS_STATUS_INVALID_VALUE; the known-good path is to convert __half
+// inputs to float, run mublasSgemm, then convert the FP32 result back to
+// __half. Correctness first — numerically identical to mublasHgemm on the
+// same inputs modulo FP16-rounding of intermediate products (and potentially
+// tighter since accumulation is FP32).
+//
+// Strided cast kernels honor leading-dim (mublas's `ldX`) instead of densely
+// packing because GPUMatrix allocations commonly use row-padded strides; a
+// dense memcpy-style cast would corrupt layout.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static __global__ void _tcnn_cast_f16_to_f32_strided(
+	const __half* __restrict__ src, int src_ld,
+	float*        __restrict__ dst, int dst_ld,
+	int rows, int cols
+) {
+	// Each thread writes one (r, c) element.
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	int r = blockIdx.y * blockDim.y + threadIdx.y;
+	if (c >= cols || r >= rows) return;
+	// Column-major layout: index = r + c * ld.
+	dst[r + c * dst_ld] = __half2float(src[r + c * src_ld]);
+}
+
+static __global__ void _tcnn_cast_f32_to_f16_strided(
+	const float*  __restrict__ src, int src_ld,
+	__half*       __restrict__ dst, int dst_ld,
+	int rows, int cols
+) {
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	int r = blockIdx.y * blockDim.y + threadIdx.y;
+	if (c >= cols || r >= rows) return;
+	dst[r + c * dst_ld] = __float2half(src[r + c * src_ld]);
+}
+
+// Allocate `bytes` of device scratch on `stream` via tcnn's arena. Returns a
+// GPUMemoryArena::Allocation (RAII-owning); caller holds it for the
+// GEMM + cast lifetime.
+static inline GPUMemoryArena::Allocation _tcnn_mublas_scratch(musaStream_t stream, size_t bytes) {
+	return allocate_workspace(stream, bytes);
+}
+
+// Launch a strided F16→F32 cast and return an owning Allocation holding the
+// F32 buffer (ld = rows_after_op, column-major packed). `rows_after_op` and
+// `cols_after_op` are in mublas's POST-op sense (if op==T, rows/cols of the
+// transposed matrix); input stride `src_ld` is the caller's original ld. We
+// interpret the source as column-major with (rows_after_op, cols_after_op)
+// laid out given op — mublasHgemm takes the same opA/opB; converting doesn't
+// affect those semantics as long as we preserve the memory layout. Easiest:
+// cast every logical element (rows_before_op*cols_before_op) into a densely
+// packed column-major buffer with ld = rows_before_op, and feed that to
+// mublasSgemm with the same opA/opB the caller supplied.
+static inline GPUMemoryArena::Allocation _tcnn_upcast_f16_to_f32(
+	musaStream_t stream,
+	const __half* src, int src_ld,
+	int rows_pre_op, int cols_pre_op,
+	float** out_ptr, int* out_ld
+) {
+	const size_t numel = (size_t)rows_pre_op * (size_t)cols_pre_op;
+	auto alloc = _tcnn_mublas_scratch(stream, numel * sizeof(float));
+	float* dst = reinterpret_cast<float*>(alloc.data());
+	dim3 block(32, 8);
+	dim3 grid(
+		(cols_pre_op + block.x - 1) / block.x,
+		(rows_pre_op + block.y - 1) / block.y
+	);
+	_tcnn_cast_f16_to_f32_strided<<<grid, block, 0, stream>>>(
+		src, src_ld, dst, rows_pre_op, rows_pre_op, cols_pre_op
+	);
+	*out_ptr = dst;
+	*out_ld  = rows_pre_op;  // densely-packed column-major
+	return alloc;
+}
+
+// half-precision GEMM path (used when network_precision_t == __half). Round 3
+// reroute: upcast to float, run mublasSgemm, downcast back into the caller's
+// __half output buffer. Accepts opA/opB/M/N/K in the caller's (already-swapped
+// for row-major-via-column-major) convention; we deduce pre-op shapes of A/B
+// from opX + M/N/K and allocate dense F32 scratch buffers at those shapes.
 static inline void _fc_mublas_gemm(
 	musaStream_t stream,
 	mublasOperation_t opA, mublasOperation_t opB,
@@ -112,20 +205,88 @@ static inline void _fc_mublas_gemm(
 	__half* C, int ldc,
 	float alpha_f, float beta_f
 ) {
-	__half alpha = __float2half(alpha_f);
-	__half beta  = __float2half(beta_f);
 	auto& handle = tcnn_mublas_handle();
 	MUBLAS_CHECK_THROW(mublasSetStream(handle, stream));
-	MUBLAS_CHECK_THROW(mublasHgemm(
+
+	// In mublas's column-major view with our row-major-swap convention, the
+	// call _fc_mublas_gemm(opA, opB, M, N, K, A, B, C) is about to issue
+	//   mublasXgemm(opB, opA, N, M, K, B, A, C).
+	// The logical shapes fed to mublas are:
+	//   B_post_op: N x K,  A_post_op: K x M,  C: N x M  (column-major)
+	// The PRE-op shapes (how B and A physically sit in memory before mublas
+	// applies opB/opA) are:
+	//   B_pre_op: (opB==N) ? (N x K) : (K x N)
+	//   A_pre_op: (opA==N) ? (K x M) : (M x K)
+	// We upcast the pre-op buffers densely; mublas then applies opB/opA to
+	// the dense float buffers exactly as it would to the original __half
+	// buffers.
+	int B_pre_rows = (opB == MUBLAS_OP_N) ? N : K;
+	int B_pre_cols = (opB == MUBLAS_OP_N) ? K : N;
+	int A_pre_rows = (opA == MUBLAS_OP_N) ? K : M;
+	int A_pre_cols = (opA == MUBLAS_OP_N) ? M : K;
+
+	float* A_f32 = nullptr; int A_f32_ld = 0;
+	float* B_f32 = nullptr; int B_f32_ld = 0;
+	auto A_alloc = _tcnn_upcast_f16_to_f32(stream, A, lda, A_pre_rows, A_pre_cols, &A_f32, &A_f32_ld);
+	auto B_alloc = _tcnn_upcast_f16_to_f32(stream, B, ldb, B_pre_rows, B_pre_cols, &B_f32, &B_f32_ld);
+
+	// Output C is N x M column-major. If beta != 0 we need C_f32 pre-seeded
+	// from C_f16 (caller-passed). If beta == 0 we still upcast (it's cheap and
+	// avoids a second code path) — wiki Fix #2 also notes muBLAS beta=0 may
+	// not fully overwrite, so pre-seeding keeps the output well-defined.
+	const int C_rows = N;
+	const int C_cols = M;
+	const size_t C_numel = (size_t)C_rows * (size_t)C_cols;
+	auto C_alloc = _tcnn_mublas_scratch(stream, C_numel * sizeof(float));
+	float* C_f32 = reinterpret_cast<float*>(C_alloc.data());
+	int C_f32_ld = C_rows;
+
+	// Pre-seed C_f32 from caller's C_f16 (honors the original ldc layout on
+	// input → dense column-major on the float side). If beta == 0 the GEMM
+	// will overwrite it fully but we still zero for safety — cheap vs GEMM.
+	if (beta_f != 0.0f) {
+		dim3 block(32, 8);
+		dim3 grid(
+			(C_cols + block.x - 1) / block.x,
+			(C_rows + block.y - 1) / block.y
+		);
+		_tcnn_cast_f16_to_f32_strided<<<grid, block, 0, stream>>>(
+			C, ldc, C_f32, C_f32_ld, C_rows, C_cols
+		);
+	} else {
+		CUDA_CHECK_THROW(musaMemsetAsync(C_f32, 0, C_numel * sizeof(float), stream));
+	}
+
+	// Run the Sgemm on the dense F32 buffers with the caller's opA/opB.
+	MUBLAS_CHECK_THROW(mublasSgemm(
 		handle,
 		opB, opA,
 		N, M, K,
-		&alpha,
-		B, ldb,
-		A, lda,
-		&beta,
-		C, ldc
+		&alpha_f,
+		B_f32, B_f32_ld,
+		A_f32, A_f32_ld,
+		&beta_f,
+		C_f32, C_f32_ld
 	));
+
+	// Downcast C_f32 (dense N x M column-major) back into caller's C (__half
+	// with stride ldc).
+	{
+		dim3 block(32, 8);
+		dim3 grid(
+			(C_cols + block.x - 1) / block.x,
+			(C_rows + block.y - 1) / block.y
+		);
+		_tcnn_cast_f32_to_f16_strided<<<grid, block, 0, stream>>>(
+			C_f32, C_f32_ld, C, ldc, C_rows, C_cols
+		);
+	}
+
+	// A_alloc / B_alloc / C_alloc destructors return their memory to the arena
+	// at end-of-scope. Because tcnn's arena allocator is stream-ordered
+	// (allocate_workspace(stream, n)), the freed memory won't be reclaimed
+	// until all kernels launched on `stream` above have completed. No
+	// explicit synchronize needed.
 }
 
 // float GEMM path
